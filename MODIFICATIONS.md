@@ -380,6 +380,33 @@
 
 ---
 
+## Round 11 — 同步频道消息回调移出主线程（对应 Android 68d3e6f）（2026-10-09）
+
+> 背景：Android `68d3e6f` 把 `setSyncChannelMsgListener` 回调里的 `saveSyncChannelMSGs`（DB 写入）移到后台线程，commit message 原文：「saveSyncChannelMSGs 在主线程与 DB 线程竞争 SQLCipher 连接池，实测会阻塞主线程触发 ANR……调用方原本就不依赖主线程语义」。iOS 的对应点是 `WKChatManager` 的 `syncChannelMessageProvider` 回调。
+
+### 11.1 问题定位（Round 4 的移植有遗漏）
+- `WKChatManager.m:813` `pullMessages:` 入口在 `[NSThread isMainThread]` 时，把整段流程派发到后台队列，再把最外层 `complete` 派发回主线程（Round 4 移植 `fac8ec7`/`68d3e6f` 时加的，`:818-834`），其注释假设「递归不在主线程」。
+- 但 `syncChannelMessageProvider` 的回调线程由 App 决定（AFNetworking 等默认回到主队列）。`calSyncForForce:` 原来在回调里直接调用 `complete`（`:1411-1413`），于是 `pullMessages` 的各个 completion（`:1019` / `:1041` / `:1064` / `:1088` 等）就在**主线程**执行 `[[WKMessageDB shared] replaceMessages:...]` 同步写 SQLCipher，并同步递归 `pullMessages` —— 主线程被 DB 阻塞，正是 `68d3e6f` 描述的场景。即 Round 4 只覆盖了「入口在主线程」，漏掉了「provider 回调回到主线程」这条路径。
+
+### 11.2 改动（`WuKongIMSDK/Classes/manager/WKChatManager.m`）
+1. 新增串行队列 `syncChannelMessageQueue`（getter 加 `@synchronized(self)` 防并发首次初始化出两个队列）。
+2. `calSyncForForce:` 的 provider 回调体整体 `dispatch_async` 到该队列：error / 无消息 / 正常三分支都改在队列内调用 `complete`。写库与后续递归不再占用主线程。
+3. `weakSelf` 判空兜底：self 已释放时以原线程直接调用 `complete`，不丢回调。
+
+### 线程语义说明（本轮最大的决策点）
+- 该改动把「provider 回调后的收尾」从 App 的回调线程移到 SDK 串行队列，即 App 的 `complete` 可能从主线程变为后台线程。取舍与 Android `68d3e6f` 一致（其 onBack 也一并后移，理由同上）。
+- 对**从主线程发起** `pullMessages` 的调用方（UI 上拉/下拉历史）：入口 `:818` 仍会把最外层 `complete` 派发回主线程，语义不变。
+- 对**从后台线程发起**、且 provider 回调回到主线程的调用方：`complete` 现在落到后台串行队列；SDK 自身的 delegate 回调本就统一 `dispatch` 到主线程（`callRecvMessagesDelegate:` 等），不受影响。
+
+### 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r11 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`）。本轮未新增文件，无需 `pod install`。
+
+### 已知未处理
+- `ackQueue`/`handleMessageQueue`/`sendMessageQueue` 的 getter 仍无锁（沿用上游写法），本次只给新增队列加锁。
+- `calSync:` 里对 `getDeleted*MessageSeq` 的查询：provider 回调路径上的这些读操作现在也落在 `syncChannelMessageQueue` 上；主线程入口路径仍由 `:818` 的整体派发覆盖。
+
+---
+
 ## 待办（后续轮次）
-- Round 11 候选：`68d3e6f` 同步消息 DB 写入移后台线程（R8 判定风险大、暂缓，需先明确 `syncChannelMessageProvider` 回调线程语义）；`WKConversationManager` 委托 getter 并发初始化；复核 `6d9d6ad` 的 10 处 DB 事务在 iOS 是否都有防御。
+- Round 12 候选：`WKConversationManager`（`:343-354` 的 `delegateLock`/`delegates` 惰性 getter 无 `@synchronized`，与 R9/R10 同类）以及其它管理器的惰性 getter 并发初始化普查；复核 `6d9d6ad` 的 10 处 DB 事务在 iOS 是否都有防御。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

@@ -51,6 +51,10 @@
 
 @property(nonatomic,strong) dispatch_queue_t sendMessageQueue; // ack任务队列
 
+// 同步频道消息回调后的收尾队列：把「写库 + 递归拉取」从 App 的 provider 回调线程（常见为主队列）移走，
+// 避免主线程同步写 SQLCipher 阻塞（对应 Android 68d3e6f）
+@property(nonatomic,strong) dispatch_queue_t syncChannelMessageQueue;
+
 @property(nonatomic,strong) NSMutableDictionary *interceptDict; // 拦截器字典
 @end
 
@@ -531,6 +535,15 @@
         _sendMessageQueue = dispatch_queue_create("im.wukongim.sendMessage", DISPATCH_QUEUE_CONCURRENT);
     }
     return _sendMessageQueue;
+}
+
+- (dispatch_queue_t)syncChannelMessageQueue {
+    @synchronized (self) { // 防止并发首次调用各建一个串行队列（导致写库分散到两个队列）
+        if(!_syncChannelMessageQueue) {
+            _syncChannelMessageQueue = dispatch_queue_create("im.wukongim.syncChannelMessage", DISPATCH_QUEUE_SERIAL);
+        }
+    }
+    return _syncChannelMessageQueue;
 }
 
 -(void) handleRecv:(NSArray<WKRecvPacket*>*) packets {
@@ -1394,23 +1407,39 @@
         }
     }
 
+    __weak typeof(self) weakSelf = self;
     [WKSDK shared].chatManager.syncChannelMessageProvider(channel, startSeq, endSeq,limit,pullMode , ^(WKSyncChannelMessageModel * _Nullable syncChannelMessageModel, NSError * _Nullable error) {
-        if(error) {
+        // 修复：syncChannelMessageProvider 的回调线程由 App 决定（AFNetworking 等默认回到主队列）。
+        // 原实现直接在此调用 complete，导致调用方（pullMessages 的各个 completion）在主线程
+        // 同步执行 [[WKMessageDB shared] replaceMessages:...] 写 SQLCipher，与 DB 线程争用连接池
+        // 而阻塞主线程（对应 Android 68d3e6f：saveSyncChannelMSGs 的 DB 写入移至后台线程）。
+        // 这里把回调后的收尾整体派发到串行队列，写库与后续递归都不再占用主线程；
+        // 最外层 App 的 complete 若从主线程发起，仍由 pullMessages 入口统一派发回主线程。
+        typeof(self) strongSelf = weakSelf;
+        if(!strongSelf) {
             if(complete) {
-                complete(nil,error);
+                complete(syncChannelMessageModel,error);
             }
             return;
         }
-        if(!syncChannelMessageModel.messages || syncChannelMessageModel.messages.count<=0) {
-            NSLog(@"没有拉取到频道[%@-%d]消息序号 %u~%u之间的消息！",channel.channelId,channel.channelType,startMessageSeq,endMessageSeq);
-            if(complete) {
-                complete(nil,[NSError errorWithDomain:@"拉取消息失败！" code:0 userInfo:nil]);
+        dispatch_async(strongSelf.syncChannelMessageQueue, ^{
+            if(error) {
+                if(complete) {
+                    complete(nil,error);
+                }
+                return;
             }
-            return;
-        }
-        if(complete) {
-            complete(syncChannelMessageModel,nil);
-        }
+            if(!syncChannelMessageModel.messages || syncChannelMessageModel.messages.count<=0) {
+                NSLog(@"没有拉取到频道[%@-%d]消息序号 %u~%u之间的消息！",channel.channelId,channel.channelType,startMessageSeq,endMessageSeq);
+                if(complete) {
+                    complete(nil,[NSError errorWithDomain:@"拉取消息失败！" code:0 userInfo:nil]);
+                }
+                return;
+            }
+            if(complete) {
+                complete(syncChannelMessageModel,nil);
+            }
+        });
 
     });
 }
