@@ -801,6 +801,27 @@
 
 
 -(void) pullMessages:(WKChannel*)channel startOrderSeq:(uint32_t)startOrderSeq endOrderSeq:(uint32_t)endOrderSeq maxMessageSeq:(uint32_t)maxMessageSeq limit:(int)limit pullMode:(WKPullMode)pullMode   maxExecCount:(NSInteger)maxExecCount complete:(void(^)(NSArray<WKMessage*> *messages,NSError *error))complete {
+    // 主线程调用（UI 上拉/下拉加载历史）时，把整个"查本地库 + 补全 reaction/reply"过程搬到后台队列，
+    // complete 再回到主线程，避免主线程同步读 DB 造成 ANR
+    // （移植 Android fac8ec7 logoutChat DB 操作移至后台线程、68d3e6f DB 写入移至后台线程）。
+    // 内部调用（socket 队列离线拉取/递归）不在主线程，走原路径，保持回调线程语义不变。
+    if([NSThread isMainThread]) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            typeof(self) strongSelf = weakSelf;
+            if(!strongSelf) {
+                return;
+            }
+            [strongSelf pullMessages:channel startOrderSeq:startOrderSeq endOrderSeq:endOrderSeq maxMessageSeq:maxMessageSeq limit:limit pullMode:pullMode maxExecCount:maxExecCount complete:^(NSArray<WKMessage *> *messages, NSError *error) {
+                if(complete) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        complete(messages, error);
+                    });
+                }
+            }];
+        });
+        return;
+    }
     if([WKSDK shared].isDebug) {
         NSLog(@"##########拉取频道[%@]消息##########",channel);
     }

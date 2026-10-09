@@ -57,10 +57,10 @@
 @property(nonatomic,assign) WKConnectStatus connectStatusInner;
 @property(nonatomic,assign) WKReason reasonCodeInner;
 
-// 心跳定时器
+// 心跳定时器（统一在主线程创建/销毁，见 startHeartbeat/stopHeartbeat）
 @property(nonatomic,strong) NSTimer *heartTimer;
-// 最后一次收到的消息时间
-@property(nonatomic) NSTimeInterval lastMsgTimeInterval;
+// 最后一次收到的消息时间（socket 队列写、主线程心跳读，用 atomic 保证可见性）
+@property(atomic) NSTimeInterval lastMsgTimeInterval;
 
 // 重连退避算法
 @property(nonatomic,strong) WKBackoff *reconnectBackoff;
@@ -908,23 +908,36 @@ static dispatch_queue_t _imsocketQueue;
 
 // 开始心跳
 -(void) startHeartbeat {
-    if(self.heartTimer){
-        [self.heartTimer invalidate];
-    }
-    // 定时器必须在主线程才能执行
+    // 心跳定时器统一在主线程串行创建/销毁：NSTimer 必须在创建它的 runloop 上 invalidate，
+    // 而 start/stop 可能分别从 socket 队列、网络监听回调、主线程触发。
+    // 原实现"先在调用线程 invalidate，再 dispatch 到主线程赋值"，会出现
+    // stopHeartbeat 先执行、主线程随后又创建一个永不失效的定时器（移植 Android 2585602 并发安全修复）。
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        weakSelf.heartTimer = [NSTimer scheduledTimerWithTimeInterval:[WKSDK shared].options.heartbeatInterval
-                                                           target:weakSelf
-                                                         selector:@selector(checkAndSendHeartbeat)
-                                                         userInfo:nil
-                                                          repeats:YES];
+        typeof(self) strongSelf = weakSelf;
+        if(!strongSelf) {
+            return;
+        }
+        [strongSelf.heartTimer invalidate];
+        NSTimer *timer = [NSTimer timerWithTimeInterval:[WKSDK shared].options.heartbeatInterval
+                                                 target:strongSelf
+                                               selector:@selector(checkAndSendHeartbeat)
+                                               userInfo:nil
+                                                repeats:YES];
+        // 加入 common modes，避免列表滚动（tracking mode）时心跳不触发被误判为断线
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+        strongSelf.heartTimer = timer;
     });
 }
 
 // 停止心跳
 -(void) stopHeartbeat {
-    [self.heartTimer invalidate];
+    // 与 startHeartbeat 走同一个主线程串行队列，保证"停止"一定发生在"创建"之后
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf.heartTimer invalidate];
+        weakSelf.heartTimer = nil;
+    });
     if([WKSDK shared].isDebug) {
         NSLog(@"心跳停止！");
     }

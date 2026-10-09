@@ -31,14 +31,20 @@
     if(self.closed) { return; }
     
     if([WKSDK shared].options.traceDBLog) {
-        NSArray *syms = [NSThread  callStackSymbols];
-        if ([syms count] > 1) {
-            NSLog(@"<%@ %p> %@ - caller: %@ ", [self class], self, NSStringFromSelector(_cmd),[syms objectAtIndex:1]);
-            if([syms count]>2) {
-                NSLog(@"%@ - caller: %@ ", NSStringFromSelector(_cmd),[syms objectAtIndex:2]);
+        // [NSThread callStackSymbols] 需要符号化，代价极高；仅在 debug 下采集完整调用栈，
+        // release 只打印方法名（移植 Android 4151c42：非 debug 跳过 getStackTrace，修复 ANR）。
+        if([WKSDK shared].isDebug) {
+            NSArray *syms = [NSThread  callStackSymbols];
+            if ([syms count] > 1) {
+                NSLog(@"<%@ %p> %@ - caller: %@ ", [self class], self, NSStringFromSelector(_cmd),[syms objectAtIndex:1]);
+                if([syms count]>2) {
+                    NSLog(@"%@ - caller: %@ ", NSStringFromSelector(_cmd),[syms objectAtIndex:2]);
+                }
+            } else {
+                 NSLog(@"<%@ %p> %@", [self class], self, NSStringFromSelector(_cmd));
             }
         } else {
-             NSLog(@"<%@ %p> %@", [self class], self, NSStringFromSelector(_cmd));
+            NSLog(@"<%@ %p> %@", [self class], self, NSStringFromSelector(_cmd));
         }
     }
    
@@ -51,11 +57,16 @@
     if(self.closed) { return; }
 
     if([WKSDK shared].options.traceDBLog) {
-        NSArray *syms = [NSThread  callStackSymbols];
-        if ([syms count] > 1) {
-            NSLog(@"<%@ %p> %@ - caller: %@ ", [self class], self, NSStringFromSelector(_cmd),[syms objectAtIndex:1]);
+        // 同 inDatabase:，release 跳过 callStackSymbols（移植 Android 4151c42）
+        if([WKSDK shared].isDebug) {
+            NSArray *syms = [NSThread  callStackSymbols];
+            if ([syms count] > 1) {
+                NSLog(@"<%@ %p> %@ - caller: %@ ", [self class], self, NSStringFromSelector(_cmd),[syms objectAtIndex:1]);
+            } else {
+                 NSLog(@"<%@ %p> %@", [self class], self, NSStringFromSelector(_cmd));
+            }
         } else {
-             NSLog(@"<%@ %p> %@", [self class], self, NSStringFromSelector(_cmd));
+            NSLog(@"<%@ %p> %@", [self class], self, NSStringFromSelector(_cmd));
         }
     }
    
