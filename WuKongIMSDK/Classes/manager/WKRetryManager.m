@@ -28,6 +28,9 @@
 @property(nonatomic,strong) NSTimer *expireMsgCheckTimer;
 
 @property(nonatomic,assign) BOOL started; // 是否已开始
+// 运行代际：start/stop 自增，用于作废尚未执行的定时器创建块
+// （原实现「stop 后 main-queue 里排队的 scheduledTimer 仍会执行」，会留下永不失效的 NSTimer）
+@property(atomic,assign) int runGeneration;
 
 @end
 @implementation WKRetryManager
@@ -104,30 +107,58 @@ static WKRetryManager *_instance;
 }
 
 -(void) start {
-    if(self.started) {
-        return;
+    int generation = 0;
+    @synchronized (self) { // 防并发重复 start 起两套定时器（Round 15）
+        if(self.started) {
+            return;
+        }
+        self.started = true;
+        generation = ++self.runGeneration;
     }
-    self.started = true;
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        [weakSelf startMessageRetry];
+        typeof(self) strongSelf = weakSelf;
+        if(!strongSelf || strongSelf.runGeneration != generation) {
+            return;
+        }
+        [strongSelf startMessageRetry];
     });
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        [weakSelf startMessageExtraRetry];
+        typeof(self) strongSelf = weakSelf;
+        if(!strongSelf || strongSelf.runGeneration != generation) {
+            return;
+        }
+        [strongSelf startMessageExtraRetry];
     });
+    // 原来这里重复 dispatch 了两次 startReminderRetry（第二次纯属多余，Round 15 去掉）
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        [weakSelf startReminderRetry];
+        typeof(self) strongSelf = weakSelf;
+        if(!strongSelf || strongSelf.runGeneration != generation) {
+            return;
+        }
+        [strongSelf startReminderRetry];
     });
     
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        [weakSelf startReminderRetry];
+    // 过期消息检查定时器：原实现直接在调用线程（连接成功回调所在的 socket 队列）上 scheduledTimer，
+    // dispatch 队列没有 runloop，导致该定时器实际从不触发；改为和其它定时器一样在主线程创建（Round 15）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) strongSelf = weakSelf;
+        if(!strongSelf || strongSelf.runGeneration != generation || !strongSelf.started) {
+            return;
+        }
+        if(strongSelf.expireMsgCheckTimer) {
+            [strongSelf.expireMsgCheckTimer invalidate];
+            strongSelf.expireMsgCheckTimer = nil;
+        }
+        strongSelf.expireMsgCheckTimer = [NSTimer scheduledTimerWithTimeInterval:WKSDK.shared.options.expireMsgCheckInterval target:strongSelf selector:@selector(startExpireMsgCheck) userInfo:nil repeats:YES];
     });
-    
-    self.expireMsgCheckTimer = [NSTimer scheduledTimerWithTimeInterval:WKSDK.shared.options.expireMsgCheckInterval target:self selector:@selector(startExpireMsgCheck) userInfo:nil repeats:YES];
 }
 
 -(void) stop {
-    self.started = false;
+    @synchronized (self) {
+        self.started = false;
+        self.runGeneration++; // 作废尚未执行的 start 定时器创建块
+    }
     if(self.retryTimer) {
         [self.retryTimer invalidate];
         self.retryTimer = nil;
@@ -193,7 +224,11 @@ static WKRetryManager *_instance;
     // 定时器必须在主线程才能执行
      __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        weakSelf.retryTimer = [NSTimer scheduledTimerWithTimeInterval:retryInterval target:weakSelf selector:@selector(retrySend) userInfo:nil repeats:YES];
+        __strong typeof(self) strongSelf = weakSelf;
+        if(!strongSelf || !strongSelf.started) { // stop 之后不再新建定时器（Round 15）
+            return;
+        }
+        strongSelf.retryTimer = [NSTimer scheduledTimerWithTimeInterval:retryInterval target:strongSelf selector:@selector(retrySend) userInfo:nil repeats:YES];
     });
    
 }
@@ -232,7 +267,11 @@ static WKRetryManager *_instance;
     // 定时器必须在主线程才能执行
      __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        weakSelf.messageExtraRetryTimer = [NSTimer scheduledTimerWithTimeInterval:retryInterval target:weakSelf selector:@selector(contentEditRetryUpload) userInfo:nil repeats:YES];
+        __strong typeof(self) strongSelf = weakSelf;
+        if(!strongSelf || !strongSelf.started) { // stop 之后不再新建定时器（Round 15）
+            return;
+        }
+        strongSelf.messageExtraRetryTimer = [NSTimer scheduledTimerWithTimeInterval:retryInterval target:strongSelf selector:@selector(contentEditRetryUpload) userInfo:nil repeats:YES];
     });
 }
 
@@ -261,7 +300,11 @@ static WKRetryManager *_instance;
     // 定时器必须在主线程才能执行
      __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        weakSelf.reminderRetryTimer = [NSTimer scheduledTimerWithTimeInterval:retryInterval target:weakSelf selector:@selector(reminderUpload) userInfo:nil repeats:YES];
+        __strong typeof(self) strongSelf = weakSelf;
+        if(!strongSelf || !strongSelf.started) { // stop 之后不再新建定时器（Round 15）
+            return;
+        }
+        strongSelf.reminderRetryTimer = [NSTimer scheduledTimerWithTimeInterval:retryInterval target:strongSelf selector:@selector(reminderUpload) userInfo:nil repeats:YES];
     });
 }
 

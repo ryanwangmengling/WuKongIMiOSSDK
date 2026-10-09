@@ -1820,15 +1820,22 @@
 }
 
 -(void) addMessageStoreBeforeIntercept:(NSString*)sid intercept:(BOOL(^)(WKMessage*message))interceptBlock {
-    self.interceptDict[sid] = interceptBlock;
+    // 可能与存储线程上的 getMessageStoreBeforeIntercepts 并发（Round 15）
+    @synchronized (self.interceptDict) {
+        self.interceptDict[sid] = interceptBlock;
+    }
 }
 
 - (void)removeMessageStoreBeforeIntercept:(NSString *)sid {
-    [self.interceptDict removeObjectForKey:sid];
+    @synchronized (self.interceptDict) {
+        [self.interceptDict removeObjectForKey:sid];
+    }
 }
 
 -(NSArray<MessageStoreBeforeIntercept>*) getMessageStoreBeforeIntercepts {
-    return  self.interceptDict.allValues;
+    @synchronized (self.interceptDict) {
+        return  self.interceptDict.allValues;
+    }
 }
 
 -(void) syncMessageExtra:(WKChannel*)channel complete:(void(^_Nullable)(NSError * _Nullable error))complete{

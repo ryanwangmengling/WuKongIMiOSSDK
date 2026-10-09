@@ -524,6 +524,51 @@ Round 7 已把连接层的门闸（backoff 重连）与 tempPackets 做了并发
 
 ---
 
+## Round 15 — 发送/重发与消息队列并发安全（对应 Android 2585602 / fac8ec7 / 68d3e6f）（2026-10-09）
+
+### 15.1 背景
+Round 14 收尾了「连接层」。本轮沿 R6 打过补丁的发送/重发入口往下走，交叉复查 `WKMessageQueueManager`（发送队列 + 定时 flush）、`WKRetryManager`（重试/上传定时器生命周期）与 `WKChatManager` 的拦截器字典，发现 4 组真实问题。
+
+### 15.2 改动
+
+**`manager/WKMessageQueueManager.m`**
+
+1. **`sendPackets` 无锁并发读写（崩溃级）**。`sendMessage:` 在**调用线程**执行 `[self.sendPackets addObject:]`，而 `flushQueue`（NSTimer，主线程）同时 `firstObject`+`removeObjectAtIndex:0`、`stop` 同时 `removeAllObjects`。`NSMutableArray` 并发「读+写」会触发 over-release/越界 -> `EXC_BAD_ACCESS`（对应 Android 2585602 并发容器类问题）。
+   - 新增 `queueLock`（`NSLock`，getter 带 `@synchronized(self)`）。
+   - `sendMessage:` 的 `addObject:`、`stop` 的 `removeAllObjects` 加锁。
+   - `flushQueue` 改为**锁内摘批、锁外编码/写 socket**：锁内算出本批数量并 `subarrayWithRange:`+`removeObjectsInRange:`，锁外再 `encode` 并 `writeData:`，避免在持锁期间做编码/网络写而阻塞发送方。
+   - `sendMaxCountOfEach <= 0` 时仍按原语义「至少发 1 个」（`if(limit<=0) limit=1;`），不改变边界行为。
+
+2. **重复 `start` / 快速 `stop` 会留下永不失效的 NSTimer（泄漏 + 双重 flush）**。原 `start` 在调用线程（连接状态回调所在的 socket 队列）同步 `invalidate` 后再 `dispatch_async(main)` 建新定时器：两次连续 `start` 时第二次执行时 `self.timer` 仍是 nil（第一次的还没在主线程序上建出来），于是两段块各建一个 timer，只有后一个写进 `self.timer`，前一个**永远活着**继续 `flushQueue`；`stop` 也会因为块还没执行而失效失败。
+   - 新增 `timerGeneration`（atomic int）：`start`/`stop` 各自自增；主线程建 timer 前先比对代际，不一致直接返回。
+   - `start` 的旧 timer 失效 + 新建**全部**移到主线程块内，保证同一时刻最多一个 timer。
+   - `stop` 的 `invalidate` 也改到主线程执行。
+
+**`manager/WKRetryManager.m`**
+
+3. **`start` 的 check-then-act 无锁 + 定时器创建与 stop 竞态**。`start` 由 `WKConnectionManager.connectStatusChange` 调用（连接状态变化可来自 socket 队列/网络监听的任意线程）；原 `if(self.started) return; self.started = true;` 无保护，并发 `start` 会起**两套**重试定时器。另外三个 `start*Retry` 里 `dispatch_async(global_low)` -> `dispatch_async(main)` 建 timer 的块在 `stop` 之后仍会执行，重建出已被 stop 的定时器。
+   - `start`/`stop` 对 `started` 的读写放进 `@synchronized(self)`。
+   - 新增 `runGeneration`（atomic int）：`start` 取代际快照并传入三个后台块，块执行前比对代际；三个主线程建 timer 块再补 `if(!strongSelf.started) return;`，`stop` 之后不再新建定时器。
+   - 去掉 `start` 里**重复 dispatch 的第二次 `startReminderRetry`**（原样是明显笔误，两次调用会各建一次提醒上传定时器）。
+
+4. **过期消息检查定时器实际从未触发**。`self.expireMsgCheckTimer = [NSTimer scheduledTimerWithTimeInterval:... target:self selector:@selector(startExpireMsgCheck) ...]` 直接在 `start` 的调用线程上调度，而该线程是 socket 的 dispatch 队列——dispatch 队列 worker 线程不跑 runloop，定时器挂上去就不响。改为和其它定时器一样在主线程创建（同样带代际/`started` 校验）。
+
+**`manager/WKChatManager.m`**
+
+5. **拦截器字典 `interceptDict` 无锁**。`addMessageStoreBeforeIntercept:`/`removeMessageStoreBeforeIntercept:`（App 任意线程注册/移除）与消息存储路径上的 `getMessageStoreBeforeIntercepts`（`saveMessages` -> 消息处理队列）并发：轻则读到半更新状态，重则 `allValues` 与 `removeObjectForKey:` 并发崩溃/丢拦截器。三个方法统一 `@synchronized(self.interceptDict)`（对应 Android 2585602 并发容器）。
+
+### 15.3 判定「不需要移植 / 已有覆盖」
+- `fac8ec7`/`68d3e6f` 中「DB 操作移至后台线程」在本轮涉及的两条链路上已分别由 Round 11（`syncChannelMessageQueue`）与 Round 4（`pullMessages` 主线程入口）覆盖。
+- `retryMessageDict`（`WKChatManager.m:46`）：本轮 grep 确认**已无任何读写点**，仅剩惰性 getter（R12 已加锁），无并发风险。
+
+### 15.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r15 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`EXIT=0`，0 error；仅有 Pods deployment target 既有告警，日志 `/tmp/wk_build_r15.log`）。本轮未新增文件，无需 `pod install`。
+
+### 15.5 已知未处理
+- `startExpireMsgCheck` 里的 `getExpireMessages` + `deleteMessage:` 仍在定时器线程（主线程）上执行，未像 Android `68d3e6f` 那样整体移到后台：`deleteMessage:` 会调用 `WKConversationManager` 的内存会话缓存（`getConversation:`/`calConversationUnread:`），要先单独评估该缓存是否线程安全，本轮不夹带。
+
+---
+
 ## 待办（后续轮次）
-- Round 15 候选：复核 `6d9d6ad` 之后剩余的数据库类提交；`WKChatManager` 的发送/重发与 DB 写入链路交叉复查。
+- Round 16 候选：复核 `6d9d6ad` 之后剩余的数据库类提交；评估「过期消息清理移到后台」所需的会话缓存线程安全前提；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
