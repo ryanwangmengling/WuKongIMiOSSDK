@@ -239,5 +239,42 @@
 
 ---
 
+## Round 7 — 连接层并发安全加固（2026-10-09）
+
+> 背景：Android `2585602`（2026-04-27「并发安全：Handler初始化、线程安全计数器、volatile可见性」）。iOS 连接层同样存在大量跨线程访问：退避重连在全局队列、socket 回调在 `_imsocketQueue`、网络监听在主队列（R2 引入）、同步完成回调在 App 提供的线程。本轮按 Android 的思路做可见性/原子性加固，并修掉 iOS 独有的 `tempPackets`（临时包）跨线程无锁读写 + 二次处理。
+
+### 7.1 退避重连门闸的 check-then-act 竞态
+- **文件**: `WuKongIMSDK/Classes/manager/WKConnectionManager.m`（`backoffReconnect`、`cancelBackoffReconnect`）
+- **问题**: 原实现 `if(self.isBackoffReconnect) return;` / `self.isBackoffReconnect = true;` / `self.reconnectGeneration++;` 三段不是原子的，两个线程可同时通过门闸，各自 `dispatch_async` 出一个退避任务 → 重复重连；`reconnectGeneration` 的 `++` 是非原子 read-modify-write，socket 队列与网络线程也会并发送达。
+- **改动**: 把「判门闸 + 置位 + generation 自增并取快照」整体放进 `@synchronized (self)`；`cancelBackoffReconnect` 的 `reconnectGeneration++` 与 `isBackoffReconnect = false` 同样加锁。
+- **对应 Android**: `2585602`（`WKConnection.isReConnecting` 加 `volatile`；`ConnectionClient.timeoutRetryCount` 由 `int` 改 `AtomicInteger`，并用 `incrementAndGet()` 的返回值做判断）。
+
+### 7.2 跨线程共享标志/计数器改为 atomic
+- **文件**: `WuKongIMSDK/Classes/manager/WKConnectionManager.m`（类扩展属性声明）
+- **问题**: `forceDisconnect`、`reconnectCount`、`isBackoffReconnect`、`reconnectGeneration`、`addrRetryCount`、`networkAvailable`、`networkMonitorStarted`、`pullOfflineFinished` 分别在「连接锁内 / socket 队列 / 全局队列 / 网络监听主队列 / 同步完成回调线程」读写，`nonatomic` 没有内存屏障，弱内存模型下可能读到旧值。典型后果：网络已恢复但退避任务仍读到 `networkAvailable == NO` 而放弃重连；或断连时读到 `forceDisconnect == NO` 触发多余重连。
+- **改动**: 上列属性全部由 `nonatomic` 改 `atomic`（`lastMsgTimeInterval` 已在 R4 改 atomic）。
+- **对应 Android**: `2585602` 的 `volatile`（`WKConnection.isReConnecting`、`WKDBHelper.uid`）与 `AtomicInteger`。
+
+### 7.3 临时包 tempPackets 跨线程无锁读写 + 二次处理（iOS 独有，崩溃风险）
+- **文件**: `WuKongIMSDK/Classes/manager/WKConnectionManager.m`（`finishedSyncConversation`、`finishedPullOffline`、`handlePacketData:`，新增 `appendTempPackets:` / `drainTempPackets`）
+- **问题**:
+  1. `pullOfflineFinished == NO` 期间，在线包在 socket 队列执行 `[self.tempPackets addObjectsFromArray:]`；而 `syncConversations:` 的完成块会在 **App 提供的线程**（网络回调线程）调用 `finishedSyncConversation` → `[self handlePackets:self.tempPackets]`。两个线程同时对同一个 `NSMutableArray` 读写、无任何锁，迭代中被 mutate 可能崩溃或丢包。
+  2. `finishedSyncConversation` 处理完临时包后**不清空**数组；随后 socket 队列下一批包到达时会再次 drain 并把这批包再处理一遍 → 消息重复入库、重复回调。
+- **改动**:
+  - 新增 `tempPacketsLock`（`NSLock`，在 `sharedManager` 初始化）；新增 `appendTempPackets:` 与 `drainTempPackets`（取出即清空）两个方法，所有 append/取出均加锁。
+  - `finishedSyncConversation` / `finishedPullOffline` 改为「先 drain（取出即清空）再 handle」，清空后不会被二次处理。
+  - `handlePacketData:` 的 drain 分支改用 `drainTempPackets` 并重新拼装数组，保持「临时包在前、当前包在后」的原有处理顺序。
+- **对应 Android**: 无直接对应（Android 离线同步模型不同），属 iOS 侧自查发现的线程错配；处理思路与 `2585602` 一致。
+
+### 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r7 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`）。本轮未新增文件，无需 `pod install`。
+
+### 已知未处理（后续轮次）
+- `68d3e6f` / `d005ce6`（Android `MsgManager`：同步频道消息的 DB 写入移至后台线程 + 删除冗余 `queryWithMsgIds`，Bugly#30231 OOM）。
+- `8c3cf3e`（收到消息先验证合法性再解码，`WKProto.java` / `CryptoUtils.java`）。
+- 提醒项内存缓存（`e91952f`）：同 R6，需同时改所有直读 `WKReminderDB` 的路径。
+
+---
+
 ## 待办（后续轮次）
-- Round 7 候选：提醒项内存缓存（`e91952e`/`e91952f`）、closeConnect 重连循环（`f37a1f5`）、在线 cmd ack（`842d29e`/`2498c0f`）、复核 `6d9d6ad`/`6a95caf`/`8ec8e49`。
+- Round 8 候选：`68d3e6f`/`d005ce6`（同步消息 DB 写入/OOM）、`8c3cf3e`（解码前校验）、提醒项内存缓存（`e91952f`）、复核 `6d9d6ad`/`6a95caf`/`8ec8e49`。

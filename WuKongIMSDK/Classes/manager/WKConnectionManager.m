@@ -45,8 +45,8 @@
  */
 @property (strong, nonatomic) NSLock  *delegateLock;
 
-// 是否强制关闭连接
-@property(nonatomic,assign) BOOL forceDisconnect;
+// 是否强制关闭连接（跨线程：连接锁内写，socket 队列/主线程读，用 atomic 保证可见性）
+@property(atomic,assign) BOOL forceDisconnect;
 
 
 // 解包的临时数据
@@ -64,22 +64,25 @@
 
 // 重连退避算法
 @property(nonatomic,strong) WKBackoff *reconnectBackoff;
-@property(nonatomic,assign) int reconnectCount; // 重连次数，连接成功设置为0
-@property(nonatomic,assign) bool isBackoffReconnect; // 是否在退避重连中
-// 用于取消已排队的退避重连（网络恢复立即重连/已连接/主动断开时自增）
-@property(nonatomic,assign) int reconnectGeneration;
+@property(atomic,assign) int reconnectCount; // 重连次数，连接成功设置为0（跨线程读写）
+@property(atomic,assign) bool isBackoffReconnect; // 是否在退避重连中（跨线程读写）
+// 用于取消已排队的退避重连（网络恢复立即重连/已连接/主动断开时自增，跨线程读写）
+@property(atomic,assign) int reconnectGeneration;
 
 // 获取连接地址失败时的退避算法（原来固定每秒无限重试）
 @property(nonatomic,strong) WKBackoff *addrBackoff;
-@property(nonatomic,assign) int addrRetryCount;
+@property(atomic,assign) int addrRetryCount; // 跨线程读写
 
 // 网络状态（移植 Android NetworkChecker）
-@property(nonatomic,assign) BOOL networkAvailable;
-@property(nonatomic,assign) BOOL networkMonitorStarted;
+@property(atomic,assign) BOOL networkAvailable; // 跨线程读写
+@property(atomic,assign) BOOL networkMonitorStarted;
 
-@property(nonatomic,assign) bool pullOfflineFinished; // 是否拉取离线完成
+@property(atomic,assign) bool pullOfflineFinished; // 是否拉取离线完成（socket 队列读、同步完成回调写）
 
-@property(nonatomic,strong) NSMutableArray<WKPacket*> *tempPackets; // 临时包（当没拉取离线完成前所有消息都存临时数组里，避免漏消息。）
+// 临时包（没拉取离线完成前所有消息都存这里，避免漏消息。）
+// 会在 socket 队列 append，也会在同步完成回调线程被取出处理，用 tempPacketsLock 串行化
+@property(nonatomic,strong) NSMutableArray<WKPacket*> *tempPackets;
+@property(nonatomic,strong) NSLock *tempPacketsLock;
 
 @property(nonatomic,copy) NSString *deviceUUID;
 
@@ -112,6 +115,7 @@ static dispatch_queue_t _imsocketQueue;
         _instance.connectStatusLock =[[NSLock alloc] init];
         _instance.tempBufferDataLock =[[NSLock alloc] init];
         _instance.tempPackets = [NSMutableArray array];
+        _instance.tempPacketsLock = [[NSLock alloc] init];
         _instance.reconnectBackoff = [WKBackoff createWithBuilder:^(WKBackoffBuilder *builder) {
             builder.base = 2; // 每次递增秒数
             builder.factor = 2; // 每次重连的系数 base*factor
@@ -321,15 +325,38 @@ static dispatch_queue_t _imsocketQueue;
 
 // 完成同步会话
 -(void) finishedSyncConversation {
-    if(self.tempPackets && self.tempPackets.count>0) {
-        [self handlePackets:self.tempPackets];
+    // 取出并清空临时包：清空可避免这批包在 socket 队列后续 drain 时被二次处理
+    NSArray<WKPacket*> *tempPackets = [self drainTempPackets];
+    if(tempPackets.count>0) {
+        [self handlePackets:tempPackets];
     }
 }
 // 离线拉取完成
 -(void) finishedPullOffline {
-    if(self.tempPackets && self.tempPackets.count>0) {
-        [self handlePackets:self.tempPackets];
+    NSArray<WKPacket*> *tempPackets = [self drainTempPackets];
+    if(tempPackets.count>0) {
+        [self handlePackets:tempPackets];
     }
+}
+
+// 追加临时包（socket 队列调用，加锁串行化）
+-(void) appendTempPackets:(NSArray<WKPacket*>*)packets {
+    if(!packets || packets.count<=0) {
+        return;
+    }
+    [self.tempPacketsLock lock];
+    [self.tempPackets addObjectsFromArray:packets];
+    [self.tempPacketsLock unlock];
+}
+
+// 取出并清空临时包（socket 队列 / 同步完成回调线程调用，加锁串行化）
+-(NSArray<WKPacket*>*) drainTempPackets {
+    NSArray<WKPacket*> *packets;
+    [self.tempPacketsLock lock];
+    packets = [self.tempPackets copy];
+    [self.tempPackets removeAllObjects];
+    [self.tempPacketsLock unlock];
+    return packets;
 }
 
 // 改变连接状态
@@ -389,12 +416,17 @@ static dispatch_queue_t _imsocketQueue;
         }
         return;
     }
-    if(self.isBackoffReconnect) {
-        return;
+    int generation = 0;
+    // 检查+置位+自增放在同一个 @synchronized 里，消除 check-then-act 竞态
+    // （对应 Android 2585602 的连接层并发安全修复）
+    @synchronized (self) {
+        if(self.isBackoffReconnect) {
+            return;
+        }
+        self.isBackoffReconnect = true;
+        self.reconnectGeneration++;
+        generation = self.reconnectGeneration;
     }
-    self.isBackoffReconnect = true;
-    self.reconnectGeneration++;
-    int generation = self.reconnectGeneration;
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         // 获取下次重连时间（单位秒）
@@ -421,8 +453,10 @@ static dispatch_queue_t _imsocketQueue;
 
 // 取消排队中的退避重连（网络恢复立即重连/已连接/主动断开时调用）
 -(void) cancelBackoffReconnect {
-    self.reconnectGeneration++;
-    self.isBackoffReconnect = false;
+    @synchronized (self) {
+        self.reconnectGeneration++;
+        self.isBackoffReconnect = false;
+    }
 }
 
 // 启动网络监听（幂等）
@@ -806,17 +840,18 @@ static dispatch_queue_t _imsocketQueue;
         }
     }
     if(!self.pullOfflineFinished) { // 如果拉取消息未完成，则在线消息都存临时数组里
-        [self.tempPackets addObjectsFromArray:packets];
+        [self appendTempPackets:packets];
         return;
     }
    
-    if(self.tempPackets.count>0) {
-        NSLog(@"有临时包,数量:%lu",(unsigned long)self.tempPackets.count);
-        for (NSInteger i=0; i<self.tempPackets.count; i++) {
-            WKPacket *tempPacket = self.tempPackets[i];
-            [packets insertObject:tempPacket atIndex:i];
-        }
-        [self.tempPackets removeAllObjects];
+    // 取出临时包，按「临时包在前，当前包在后」的顺序处理
+    NSArray<WKPacket*> *pendingPackets = [self drainTempPackets];
+    if(pendingPackets.count>0) {
+        NSLog(@"有临时包,数量:%lu",(unsigned long)pendingPackets.count);
+        NSMutableArray<WKPacket*> *allPackets = [NSMutableArray arrayWithCapacity:pendingPackets.count+packets.count];
+        [allPackets addObjectsFromArray:pendingPackets];
+        [allPackets addObjectsFromArray:packets];
+        packets = allPackets;
     }
     [self handlePackets:packets];
    
