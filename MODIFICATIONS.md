@@ -203,5 +203,41 @@
 
 ---
 
+## Round 6 — 防御性补丁：空列表非法 SQL / 发送入口参数校验（2026-10-09）
+
+> 背景：本轮原计划做「功能补齐」，勘察后发现 Android 的 typing/频道状态并不是 SDK 内置能力（`WKCMDKeys.wk_typing` 只是常量，`WKChannelState` 只是 `WKSyncChat.channel_status` 的字段声明、全库无消费；`3904ad5`「新增频道状态」实质只是加字段并恢复被注释的 reaction 查询），iOS 的 `WKCMDManager` 本就只做 cmd 转发，因此这类能力属于 App 层，不适合作为 SDK 补丁。提醒项内存缓存（Android `e91952f`）是真功能，但 iOS 有大量直接读 `WKReminderDB` 的调用点，只给 manager 加缓存会与直读不一致，推迟到后续轮次。本轮改为移植 Android 的两个纯防御性修复：空列表拼出非法 SQL、发送/重发入口的空指针。
+
+### 6.1 空列表不再拼出非法 SQL `IN ()`
+- **文件**: `WuKongIMSDK/Classes/db/WKMessageDB.m`（`getMessagesWithMessageIDs:`、`deleteMessagesWithClientSeqs:`、`deleteMessagesWithMessageIDs:db:`）、`WuKongIMSDK/Classes/db/WKReminderDB.m`（`getReminders:`）
+- **问题**: 调用方传入空数组（或 nil）时，`[ids componentsJoinedByString:@","]` 会拼出 `IN ()` / `IN (null)` 这类非法 SQL，Android 对应问题见 Bugly#30010（`SQLiteException`）。iOS 同样会抛出 SQLite 错误并让整个查询失败。
+- **改动**: 四个方法入口补空值短路：
+  - `WKMessageDB.getMessagesWithMessageIDs:` → `if(!messageIDs || messageIDs.count == 0) return @[];`
+  - `WKMessageDB.deleteMessagesWithClientSeqs:` → `if(!ids || ids.count == 0) return;`
+  - `WKMessageDB.deleteMessagesWithMessageIDs:db:`：原写法 `if(messageIDs && messageIDs.count==0)` 只判了空数组、**没判 nil**（nil 会继续往下拼 `IN (null)`），改为 `if(!messageIDs || messageIDs.count == 0) return;`
+  - `WKReminderDB.getReminders:` → `if(!ids || ids.count == 0) return @[];`
+- **对应 Android**: `fa953e3`（「防御空列表生成非法SQL IN ()导致SQLiteException(Bugly#30010)」，在 `ConversationDbManager.queryWithChannelIds`/`queryWithExtraChannelIds`/`MsgDbManager.queryWithMsgIds` 入口判空）。
+- **说明**: iOS 其余 `IN (%@)` 站点（`WKReactionDB.m:40`、`WKRobotDB.m:42/61`、`WKChannelMemberDB.m:257/276`、`WKCMDDB.m:118`、`WKConversationDB.m:259`、`WKReminderDB.m:125`、`WKMessageDB.m:452/473/484/915`）此前已自带判空，无需改动；已知调用点在调用侧也做了判空（`WKPinnedMessageManager.m:47-56`、`WKChatManager.m:1800-1806`），但按 Android 的做法在 DB 层兜底更稳妥。
+
+### 6.2 发送/重发入口参数校验
+- **文件**: `WuKongIMSDK/Classes/manager/WKChatManager.m`（`sendMessage:content:channel:setting:clientMsgNo:topic:` :77，其余重载都汇入它；`resendMessage:` :94）
+- **问题**: Android `202d1f6` 修的是重发消息时 `channelId` 或 `clientMsgNo` 为 null 导致的 NPE；iOS 是 OC，nil 不会崩溃，但**会用空 channelId 落库并发出脏消息**，后果更隐蔽（消息在本地存在、对端无法正确路由）。
+- **改动**: 两个入口都校验关键参数，非法时打 WARN 日志并 `return nil`，不落库、不发送：
+  - `sendMessage:...`：`content`/`channel`/`channel.channelId` 为空即忽略。
+  - `resendMessage:`：另加 `message`/`message.content`/`clientMsgNo` 校验（与发送入口保持一致）。
+- **对应 Android**: `202d1f6`（「修复重发消息时channelId或clientMsgNo为null导致的NPE」，`WKConnection.sendMessage` / `WKProto.getSendBaseMsg` 层判空，iOS 对应点在更早的 `WKChatManager` 入口）。
+- **未移植的同类项（复核后判定不需要）**:
+  - `6a95caf`（`MsgDbManager.insertOrReplaceExtra` 空指针）：iOS `updateMessageExtra:` 经 `extraToStr:` 已容 nil。
+  - `8ec8e49`（`ChannelMembersDbManager.queryCount` cursor null）：iOS `getMemberCount:` 用 FMResultSet，FMDB 不返回 nil。
+  - `6d9d6ad`（`getDb()` 空指针 10 处）：Round 3 已在 `WKFMDatabaseQueue` 用 `isClosed` 兜底，等价。
+
+### 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r6 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`）。本轮未新增文件，无需 `pod install`。
+
+### 已知未处理（后续轮次）
+- 提醒项内存缓存（Android `e91952f`）：iOS 的 `WKConversationManager`/`WKChatManager` 多处直接读 `WKReminderDB`（`WKConversationManager.m:101/111/197/238/282/308`、`WKChatManager.m:379/709/1547`），加缓存必须同时改这些读路径，否则会读到过期数据。
+- `f37a1f5`（closeConnect 关闭旧连接后自动重连形成连接循环）、`842d29e`/`2498c0f`（在线 cmd 未回 ack）仍未移植。
+
+---
+
 ## 待办（后续轮次）
-- Round 6: 功能补齐（typing/输入中、频道状态、群成员同步、提醒缓存、信令）。
+- Round 7 候选：提醒项内存缓存（`e91952e`/`e91952f`）、closeConnect 重连循环（`f37a1f5`）、在线 cmd ack（`842d29e`/`2498c0f`）、复核 `6d9d6ad`/`6a95caf`/`8ec8e49`。

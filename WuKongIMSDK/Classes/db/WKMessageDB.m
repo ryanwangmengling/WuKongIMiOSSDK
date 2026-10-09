@@ -506,7 +506,10 @@ static WKMessageDB *_instance;
 }
 
 -(NSArray<WKMessage*>*) getMessagesWithMessageIDs:(NSArray<NSNumber*>*)messageIDs {
-    
+    // 防御空列表生成非法 SQL IN () 导致 SQLiteException（对应 Android fa953e3）
+    if(!messageIDs || messageIDs.count == 0) {
+        return @[];
+    }
     __block NSMutableArray *messages = [NSMutableArray new];
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
         FMResultSet *result;
@@ -767,6 +770,10 @@ static WKMessageDB *_instance;
 }
 
 -(void) deleteMessagesWithClientSeqs:(NSArray<NSNumber*>*)ids {
+    // 防御空列表/空指针生成非法 SQL IN ()（对应 Android fa953e3）
+    if(!ids || ids.count == 0) {
+        return;
+    }
     [WKDB.sharedDB.dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
         NSString *idStrs = [ids componentsJoinedByString:@","];
         [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_DELETE_CLIENT_SEQS,idStrs]];
@@ -781,7 +788,7 @@ static WKMessageDB *_instance;
 }
 
 -(void) deleteMessagesWithMessageIDs:(NSArray<NSNumber*>*)messageIDs db:(FMDatabase*)db {
-    if(messageIDs && messageIDs.count==0) {
+    if(!messageIDs || messageIDs.count == 0) {
         return;
     }
     if(messageIDs.count == 1) {

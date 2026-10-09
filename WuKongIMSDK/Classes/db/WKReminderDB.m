@@ -156,6 +156,10 @@ static WKReminderDB *_instance;
 }
 
 -(NSArray<WKReminder*>*) getReminders:(NSArray<NSNumber*>*)ids {
+    // 防御空列表生成非法 SQL IN ()（对应 Android fa953e3）
+    if(!ids || ids.count == 0) {
+        return @[];
+    }
     __block NSMutableArray<WKReminder*> *reminders = [NSMutableArray array];
     [[WKDB sharedDB].dbQueue  inDatabase:^(FMDatabase * _Nonnull db) {
         FMResultSet *resultSet =[db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_GET_WITH_IDS,[ids componentsJoinedByString:@","]]];

@@ -75,6 +75,11 @@
 }
 
 -(WKMessage*) sendMessage:(WKMessageContent*)content channel:(WKChannel*)channel setting:(WKSetting*)setting clientMsgNo:(NSString*)clientMsgNo topic:(NSString*)topic{
+    // 入口校验非法参数，避免保存出 channelId 为空的消息并在后续发送/落库流程中产生脏数据（对应 Android 202d1f6）
+    if(!content || !channel || !channel.channelId || [channel.channelId isEqualToString:@""]) {
+        NSLog(@"WARN: sendMessage 参数非法（content 为空，或 channel/channelId 为空），已忽略本次发送。");
+        return nil;
+    }
     WKMessageStatus messageStatus = WK_MESSAGE_WAITSEND;
     if([self isMediaMessage:content]) { // 如果是多媒体消息，消息不触发重试功能，等多媒体上传完毕后，再将消息改为待发送然后发送出去
         messageStatus = WK_MESSAGE_UPLOADING;
@@ -92,6 +97,11 @@
 }
 
 -(WKMessage*) resendMessage:(WKMessage*)message {
+    // 与发送入口一致的非法参数校验：缺 channelId 或 clientMsgNo 的重发会写出脏数据/重复消息（对应 Android 202d1f6）
+    if(!message || !message.content || !message.channel || !message.channel.channelId || [message.channel.channelId isEqualToString:@""] || !message.clientMsgNo || [message.clientMsgNo isEqualToString:@""]) {
+        NSLog(@"WARN: resendMessage 参数非法（message/content/channel/channelId/clientMsgNo 为空），已忽略本次重发。");
+        return nil;
+    }
     [[WKMessageDB shared] destoryMessage:message];
     return  [self sendMessage:message.content channel:message.channel setting:message.setting clientMsgNo:message.clientMsgNo topic:message.topic];
 }
