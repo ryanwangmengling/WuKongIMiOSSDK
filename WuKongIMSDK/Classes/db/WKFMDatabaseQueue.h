@@ -21,6 +21,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 -(void) close;
 
+/**
+ 队列是否可用：未关闭且内部 FMDatabaseQueue 创建成功。
+
+ 对应 Android 6d9d6ad：getDb() == null 时直接返回，不在空连接上执行事务。
+ */
+- (BOOL)isReady;
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -26,9 +26,17 @@
     return fMDatabaseQueue;
 }
 
+// 队列是否可用：未关闭且内部 FMDatabaseQueue 创建成功。
+// FMDatabaseQueue 打开失败时 databaseQueueWithPath: 返回 nil（路径不可写/磁盘满/文件损坏），
+// 这种“空壳”队列既没 closed 也没法执行任何语句，所有入口应直接返回
+// （对应 Android 6d9d6ad 的 getDb() == null 时跳过事务）。
+- (BOOL)isReady {
+    return !self.closed && self.queue != nil;
+}
+
 
 - (void)inDatabase:(void (NS_NOESCAPE^)(FMDatabase * _Nonnull db))block {
-    if(self.closed) { return; }
+    if(![self isReady]) { return; }
     
     if([WKSDK shared].options.traceDBLog) {
         // [NSThread callStackSymbols] 需要符号化，代价极高；仅在 debug 下采集完整调用栈，
@@ -54,7 +62,7 @@
 }
 
 - (void)inTransaction:(__attribute__((noescape)) void (^)(FMDatabase *db, BOOL *rollback))block {
-    if(self.closed) { return; }
+    if(![self isReady]) { return; }
 
     if([WKSDK shared].options.traceDBLog) {
         // 同 inDatabase:，release 跳过 callStackSymbols（移植 Android 4151c42）

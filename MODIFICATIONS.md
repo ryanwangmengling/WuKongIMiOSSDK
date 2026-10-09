@@ -453,6 +453,42 @@ R9/R10 已给 `WKMemoryCache`、`WKChannelManager`、`WKReminderManager` 的惰�
 
 ---
 
+## Round 13 — 数据库不可用防御（打开失败 / 迁移修复失败）（对应 Android 6d9d6ad）（2026-10-09）
+
+### 13.1 背景与定位
+Android `6d9d6ad`「SDK 全量修复 getDb() 空指针 — 10 处 DB 事务操作统一加空判断」：把 `getDb()` 取到局部变量、null 时跳过事务、`finally` 复用同一个 db 引用（避免 TOCTOU）、`endTransaction` 再包一层 try-catch。
+
+iOS 复核结论：
+- **事务内空指针 → 已有防御**：iOS 的 DB 入口是 `[[WKDB sharedDB].dbQueue inDatabase:/inTransaction:]`，`dbQueue` 为 nil 时是 ObjC 对 nil 发消息（no-op）；R3/R4 又给 `WKFMDatabaseQueue` 加了 `closed` 短路（对应 Android `WKDBHelper.isClosed`、`bdc02e2`）。此部分 R3 已覆盖（见本文件 Round 3 / Round 10 章节）。
+- **本轮发现的真实缺口**：`closed` 只在 SDK 自己调 `close` 时才为 YES。若 `[FMDatabaseQueue databaseQueueWithPath:]` 打开失败（路径不可写 / 磁盘满 / 文件损坏），FMDB 返回 **nil**，而 `WKDB.switchDB:` 会把它包成空壳 `WKFMDatabaseQueue` 安装到 `self.dbQueue`，同时 `currentUid` 已写入 → 之后 `needSwitchDB:` 永远返回 NO，即使磁盘/文件后来恢复也**永不重试**；并且 `migrateDatabase` 的返回值被忽略，核心表缺失时照样继续使用这个库。
+
+### 13.2 改动
+`db/WKFMDatabaseQueue.h` / `.m`
+- 新增 `- (BOOL)isReady`：`!self.closed && self.queue != nil`。
+- `inDatabase:` / `inTransaction:` 入口判断由 `if(self.closed)` 改为 `if(![self isReady])`：打开失败的空壳队列现在连 `traceDBLog` 都不执行，直接返回（对应 Android「getDb() == null 跳过事务」）。
+
+`db/WKDB.m`
+- `switchDB:` 拆出 `openFailed` 分支：`fmdb == nil` 时不安装空壳队列，改为 `dbQueue = nil` + `currentUid/currentDBPrefix = nil`，日志 `[WKDB] 打开数据库失败，数据库暂不可用: <path>`，延迟关闭旧队列后 return。
+- 迁移后新增可用性校验：`if(![self checkCoreTables])` → 日志「数据库迁移/修复失败且核心表缺失，暂不启用本连接」→ 锁内（且仅当 `self.dbQueue == newQueue`）卸载队列、清空用户状态、`_manager = nil`、`[newQueue close]`，延迟关闭旧队列后 return。这样下次 `connect` 时 `needSwitchDB:` 返回 YES 可重试；期间所有 DB 访问因 `dbQueue == nil` 安全 no-op。
+- 抽出 `- (void)closeOldQueueAsync:newQueue:`（原「延迟 0.5s 关闭旧队列」逻辑，移植 Android 594ccb2），三处调用复用。
+- `createMigrationsTable`：队列不存在或 `!isReady` 时显式 `_manager = nil` 并返回 —— 修复「队列不可用却沿用上一次 `_manager`（持有上一个用户 / 已关闭的 FMDatabase）」；改用局部 `__block mgr` 收集，块结束后再赋给 `_manager`；块内加 `if(!db) return;`。
+- `checkCoreTables`：`if(!queue || ![queue isReady]) return NO;`。
+
+### 13.3 为什么不误伤正常路径
+- 首次建库：`migrateDatabase` 先建 `schema_migrations`，再跑 Migrations 资源里的 SQL；`message/conversation/channel` 建好后 `checkCoreTables` 为 YES，走原路径。
+- `checkCoreTables` 本就是本 fork 自 R3 起用做「DB 是否可用」的判据（R3 用它判断损坏并修复），本轮只是复用同一判据。
+- SDK 内无任何代码调用 `createTable:`/`dropTable:`（`WKDB.h` 也未暴露），Example App 也不建表；表一律来自 Migrations 资源。因此 `checkCoreTables == NO` 确实等价于「这个库不可用」，不存在「调用方稍后自己建表」的场景被误伤。
+
+### 13.4 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r13 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，0 error）。
+- 改动后用 `grep -n 'newQueue\|openFailed'` 复查，确认 `[newQueue inDatabase:]` 只有一处（编辑过程中曾短暂重复，已删除）。本轮未新增文件，无需 `pod install`。
+
+### 13.5 判定不移植
+- `6d9d6ad` 那 10 处 `beginTransaction/endTransaction` 本身：iOS 用 FMDB 的 `inTransaction:` 封装，`endTransaction` 由 FMDB 在 finally 里自行调用且内部有保护，不存在 Android 的「多次 getDb() 取到不同连接」/TOCTOU 问题。
+- `8ec8e49`/`6a95caf`（cursor NPE）：ObjC 对 nil 发消息安全，已在 Round 10 记录。
+
+---
+
 ## 待办（后续轮次）
-- Round 13 候选：复核 `6d9d6ad` 的 10 处 DB 事务在 iOS 是否都有防御；`WKConnectionManager` 的 `loopGetAddrToConnect` / 心跳定时器与 delegate 锁的交叉复查。
+- Round 14 候选：`WKConnectionManager` 的 `loopGetAddrToConnect` / 心跳定时器与 delegate 锁的交叉复查；复核 `6d9d6ad` 后剩余的数据库类提交。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

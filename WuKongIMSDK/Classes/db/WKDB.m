@@ -62,6 +62,7 @@ static WKDBMigrationManager *_manager;
     WKFMDatabaseQueue *oldQueue = nil;
     WKFMDatabaseQueue *newQueue = nil;
     NSString *dbKey = uid ?: @"";
+    BOOL openFailed = NO;
     @synchronized (self) {
         // 同一用户且前缀未变时直接复用现有连接（needSwitchDB 已前置判断，这里再兜底一次）
         if(self.dbQueue && self.currentUid && [self.currentUid isEqualToString:dbKey] && [self.currentDBPrefix isEqualToString:([WKSDK shared].options.dbPrefix ?: @"")]) {
@@ -84,10 +85,25 @@ static WKDBMigrationManager *_manager;
             NSLog(@"数据库路径 -> %@",dbPath);
         }
         FMDatabaseQueue *fmdb = [FMDatabaseQueue databaseQueueWithPath:dbPath];
-        newQueue = [WKFMDatabaseQueue databaseQueue:fmdb];
-        // 先安装新队列，再关闭旧队列：旧队列关闭后其 inDatabase/inTransaction 会被 isClosed 短路
-        self.dbQueue = newQueue;
-        self.currentDBPrefix = [WKSDK shared].options.dbPrefix;
+        if(fmdb) {
+            newQueue = [WKFMDatabaseQueue databaseQueue:fmdb];
+            // 先安装新队列，再关闭旧队列：旧队列关闭后其 inDatabase/inTransaction 会被 isClosed 短路
+            self.dbQueue = newQueue;
+            self.currentDBPrefix = [WKSDK shared].options.dbPrefix;
+        } else {
+            // FMDatabaseQueue 打开失败会返回 nil（路径不可写 / 磁盘满 / 文件损坏 / SQLCipher key 错误）。
+            // 不安装这个空壳队列：清空当前用户状态，让下次 connect 时 needSwitchDB: 返回 YES 重试；
+            // 期间所有 DB 访问因 dbQueue 为 nil 而安全地 no-op（移植 Android 6d9d6ad 的 getDb() 空防御思路）。
+            NSLog(@"[WKDB] 打开数据库失败，数据库暂不可用: %@", dbPath);
+            self.dbQueue = nil;
+            self.currentUid = nil;
+            self.currentDBPrefix = nil;
+            openFailed = YES;
+        }
+    }
+    if(openFailed) {
+        [self closeOldQueueAsync:oldQueue newQueue:nil];
+        return;
     }
     [newQueue inDatabase:^(FMDatabase * _Nonnull db) {
         [db setKeyWithData:[dbKey dataUsingEncoding:NSUTF8StringEncoding]];
@@ -98,7 +114,31 @@ static WKDBMigrationManager *_manager;
     }];
     // 合并数据库
     [self migrateDatabase];
+    // 迁移/修复后核心表仍不存在 → 这个库不可用（文件损坏、磁盘不可写、key 错误、打开失败等）。
+    // 不能把空壳队列留在 self.dbQueue 上：那会让 needSwitchDB: 永远返回 NO，之后即使磁盘/文件
+    // 恢复也永不重试。这里卸载队列并清空用户状态，让下次 connect 重试；期间 DB 访问安全 no-op
+    // （对应 Android 6d9d6ad 的空防御思路）。
+    if(![self checkCoreTables]) {
+        NSLog(@"[WKDB] 数据库迁移/修复失败且核心表缺失，暂不启用本连接: %@", uid);
+        @synchronized (self) {
+            if(self.dbQueue == newQueue) {
+                self.dbQueue = nil;
+                self.currentUid = nil;
+                self.currentDBPrefix = nil;
+            }
+            _manager = nil;
+        }
+        [newQueue close];
+        [self closeOldQueueAsync:oldQueue newQueue:newQueue];
+        return;
+    }
     // 迁移完成后异步关闭旧队列，避免在旧队列事务中被同步 close 阻塞（移植 Android 594ccb2 的延迟关闭）
+    [self closeOldQueueAsync:oldQueue newQueue:newQueue];
+}
+
+// 延迟关闭旧队列（移植 Android 594ccb2 的延迟关闭）：
+// 不阻塞当前线程，等旧队列上可能在跑的事务结束后再 close。
+-(void) closeOldQueueAsync:(WKFMDatabaseQueue*)oldQueue newQueue:(WKFMDatabaseQueue*)newQueue {
     if(oldQueue && oldQueue != newQueue) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             [oldQueue close];
@@ -106,16 +146,25 @@ static WKDBMigrationManager *_manager;
     }
 }
 -(void) createMigrationsTable{
-    [[self dbQueue] inDatabase:^(FMDatabase * _Nonnull db) {
-        _manager = [WKDBMigrationManager managerWithDatabase:db];
-         if(![_manager hasMigrationsTable]) {
-             NSError *error;
-             [_manager createMigrationsTable:&error];
-             if(error) {
-                  NSLog(@"createMigrationsTable is error 【%@】",error);
-             }
-         }
+    WKFMDatabaseQueue *queue = self.dbQueue;
+    if(!queue || ![queue isReady]) {
+        // 队列不可用时不能沿用上一次的 _manager：它持有的是上一个用户 / 已关闭的 FMDatabase
+        _manager = nil;
+        return;
+    }
+    __block WKDBMigrationManager *mgr = nil;
+    [queue inDatabase:^(FMDatabase * _Nonnull db) {
+        if(!db) { return; }
+        mgr = [WKDBMigrationManager managerWithDatabase:db];
+        if(![mgr hasMigrationsTable]) {
+            NSError *error;
+            [mgr createMigrationsTable:&error];
+            if(error) {
+                 NSLog(@"createMigrationsTable is error 【%@】",error);
+            }
+        }
     }];
+    _manager = mgr;
 }
 -(BOOL) migrateDatabase{
     [self createMigrationsTable];
@@ -152,7 +201,7 @@ static WKDBMigrationManager *_manager;
 -(BOOL) checkCoreTables {
     __block BOOL ok = NO;
     WKFMDatabaseQueue *queue = self.dbQueue;
-    if(!queue) {
+    if(!queue || ![queue isReady]) {
         return NO;
     }
     [queue inDatabase:^(FMDatabase * _Nonnull db) {
