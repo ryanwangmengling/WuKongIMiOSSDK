@@ -27,6 +27,7 @@
 #import "WKChatManagerInner.h"
 #import "WKConversationManagerInner.h"
 #import "WKMessageQueueManager.h"
+#import "WKNetworkMonitor.h"
 
 
 @interface WKConnectionManager ()<GCDAsyncSocketDelegate>
@@ -65,6 +66,16 @@
 @property(nonatomic,strong) WKBackoff *reconnectBackoff;
 @property(nonatomic,assign) int reconnectCount; // 重连次数，连接成功设置为0
 @property(nonatomic,assign) bool isBackoffReconnect; // 是否在退避重连中
+// 用于取消已排队的退避重连（网络恢复立即重连/已连接/主动断开时自增）
+@property(nonatomic,assign) int reconnectGeneration;
+
+// 获取连接地址失败时的退避算法（原来固定每秒无限重试）
+@property(nonatomic,strong) WKBackoff *addrBackoff;
+@property(nonatomic,assign) int addrRetryCount;
+
+// 网络状态（移植 Android NetworkChecker）
+@property(nonatomic,assign) BOOL networkAvailable;
+@property(nonatomic,assign) BOOL networkMonitorStarted;
 
 @property(nonatomic,assign) bool pullOfflineFinished; // 是否拉取离线完成
 
@@ -105,8 +116,15 @@ static dispatch_queue_t _imsocketQueue;
             builder.base = 2; // 每次递增秒数
             builder.factor = 2; // 每次重连的系数 base*factor
             builder.jitter = 0;
-            builder.cap = 60 * 1000; // 60s
+            builder.cap = 60; // 60秒（backoff 返回秒数，调用方用 sleepForTimeInterval: 按秒处理；原值 60*1000=60000 秒≈16.6 小时）
         }];
+        _instance.addrBackoff = [WKBackoff createWithBuilder:^(WKBackoffBuilder *builder) {
+            builder.base = 1;   // 首次 1 秒
+            builder.factor = 2; // 指数递增
+            builder.jitter = 0;
+            builder.cap = 30;   // 最多 30 秒（单位：秒）
+        }];
+        _instance.networkAvailable = YES;
         
     });
     return _instance;
@@ -119,6 +137,9 @@ static dispatch_queue_t _imsocketQueue;
     [self.connectStatusLock lock];
     self.forceDisconnect = false;
     [self.connectStatusLock unlock];
+    
+    // 启动网络监听（幂等），并获取当前网络状态
+    [self startNetworkMonitor];
     
     if(![WKSDK shared].options.hasLogin) {
         if( [WKSDK shared].options.connectInfoCallback) {
@@ -179,19 +200,26 @@ static dispatch_queue_t _imsocketQueue;
          [self changeConnectStatus:WKDisconnected];
         return;
     }
+    // 修复：无网络时不再每秒空转重试，等网络恢复回调再触发
+    if(!self.networkAvailable && self.getConnectAddr) {
+        if([WKSDK shared].isDebug) {
+            NSLog(@"当前无网络，暂停获取连接地址");
+        }
+        return;
+    }
     // 开始建立socket连接
     if(self.getConnectAddr) {
         __weak typeof(self) weakSelf = self;
         self.getConnectAddr(^(NSString * _Nonnull addr) {
             if(!addr || [addr isEqualToString:@""]) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    [weakSelf loopGetAddrToConnect];
-                });
+                [weakSelf scheduleRetryGetAddr];
                 return;
             }
             NSArray *addrs = [addr componentsSeparatedByString:@":"];
-            if(addrs.count>0) {
+            if(addrs.count > 1) { // 修复：原为 addrs.count>0，地址不含端口时 addrs[1] 会越界崩溃
                 [weakSelf connectSocket:addrs[0] port:[addrs[1] integerValue]];
+            }else {
+                [weakSelf connectSocket:addr port:[WKSDK shared].options.port];
             }
         });
     }else {
@@ -199,9 +227,32 @@ static dispatch_queue_t _imsocketQueue;
     }
 }
 
+// 获取连接地址失败时的退避重试（原来固定每秒无限重试）
+-(void) scheduleRetryGetAddr {
+    if(self.forceDisconnect || ![WKSDK shared].options.hasLogin) {
+        return;
+    }
+    if(!self.networkAvailable) { // 等网络恢复回调触发
+        return;
+    }
+    long delay = [self.addrBackoff backoff:self.addrRetryCount];
+    self.addrRetryCount++;
+    if([WKSDK shared].isDebug) {
+        NSLog(@"%ld秒后重新获取连接地址.",delay);
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [weakSelf loopGetAddrToConnect];
+    });
+}
+
 -(void) connectSocket:(NSString*)host port:(uint16_t)port {
     if ([WKSDK shared].isDebug) {
         NSLog(@"开始连接IM服务器 -> %@:%i",host,port);
+    }
+    // 修复：无网络时不再发起连接，等网络恢复回调触发
+    if(!self.networkAvailable) {
+        return;
     }
     self.ssocket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:_imsocketQueue];
     NSError *error=nil;
@@ -210,6 +261,8 @@ static dispatch_queue_t _imsocketQueue;
         NSLog(@"连接IM服务器失败-> %@",error);
         // 状态变为：已断开
         [self changeConnectStatus:WKDisconnected];
+        // 修复：连接失败时原来直接停住不再重连
+        [self backoffReconnect];
     }
 }
 
@@ -294,6 +347,9 @@ static dispatch_queue_t _imsocketQueue;
     self.forceDisconnect = force;
     [self.connectStatusLock unlock];
     
+    // 主动断开时取消排队中的退避重连
+    [self cancelBackoffReconnect];
+    
     [self.ssocket disconnect];
     
 }
@@ -305,6 +361,9 @@ static dispatch_queue_t _imsocketQueue;
     [self.connectStatusLock unlock];
     
     [[WKSDK shared].channelManager removeChannelAllCache];
+    
+    // 退出登录时取消排队中的退避重连
+    [self cancelBackoffReconnect];
     
     [self.ssocket disconnect];
 }
@@ -322,25 +381,99 @@ static dispatch_queue_t _imsocketQueue;
 }
 // 重连（支持退避算法）
 -(void) backoffReconnect {
+    // 移植 Android NetworkChecker：无网络时不消耗重连次数、不空转重连，
+    // 等网络恢复后由 onNetworkStatusChange: 立即触发
+    if(!self.networkAvailable) {
+        if([WKSDK shared].isDebug) {
+            NSLog(@"当前无网络，暂停重连，等待网络恢复");
+        }
+        return;
+    }
     if(self.isBackoffReconnect) {
         return;
     }
     self.isBackoffReconnect = true;
+    self.reconnectGeneration++;
+    int generation = self.reconnectGeneration;
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         // 获取下次重连时间（单位秒）
         long backoffTime = [weakSelf.reconnectBackoff backoff:weakSelf.reconnectCount];
         if([WKSDK shared].isDebug) {
-            NSLog(@"%lu秒后进行重连.",backoffTime);
+            NSLog(@"%ld秒后进行重连.",backoffTime);
         }
-         weakSelf.reconnectCount++;
+        weakSelf.reconnectCount++;
         [NSThread sleepForTimeInterval:backoffTime];
         weakSelf.isBackoffReconnect = false;
+        // 退避期间若已被取消（网络恢复立即重连/已连接/主动断开），放弃本次重连
+        if(generation != weakSelf.reconnectGeneration) {
+            return;
+        }
+        if(!weakSelf.networkAvailable) {
+            return;
+        }
         // 重连
         [weakSelf reconnect];
         
        
     });
+}
+
+// 取消排队中的退避重连（网络恢复立即重连/已连接/主动断开时调用）
+-(void) cancelBackoffReconnect {
+    self.reconnectGeneration++;
+    self.isBackoffReconnect = false;
+}
+
+// 启动网络监听（幂等）
+-(void) startNetworkMonitor {
+    if(self.networkMonitorStarted) {
+        return;
+    }
+    self.networkMonitorStarted = YES;
+    WKNetworkMonitor *monitor = [WKNetworkMonitor shared];
+    __weak typeof(self) weakSelf = self;
+    monitor.networkStatusChange = ^(BOOL available) {
+        [weakSelf onNetworkStatusChange:available];
+    };
+    [monitor start];
+    // start 会同步探测一次，这里读取真实结果，避免异步回调到达前误判
+    self.networkAvailable = monitor.isNetworkAvailable;
+}
+
+// 网络状态变化（移植 Android NetworkChecker）
+-(void) onNetworkStatusChange:(BOOL)available {
+    if(available == self.networkAvailable) {
+        return;
+    }
+    self.networkAvailable = available;
+    if(!available) {
+        if([WKSDK shared].isDebug) {
+            NSLog(@"无网络连接...");
+        }
+        // 取消排队中的退避重连，避免无网络空转
+        [self cancelBackoffReconnect];
+        [self stopHeartbeat];
+        if(!self.forceDisconnect) {
+            [self changeConnectStatus:WKNoNetwork];
+        }
+        return;
+    }
+    // 有网络
+    if([WKSDK shared].isDebug) {
+        NSLog(@"网络已恢复，重置重连计数并尝试重连");
+    }
+    // 参考 Android NetworkChecker：网络恢复时重置重连计数，给予完整的重连机会
+    self.reconnectCount = 0;
+    self.addrRetryCount = 0;
+    [self cancelBackoffReconnect];
+    if(self.forceDisconnect || ![WKSDK shared].options.hasLogin) {
+        return;
+    }
+    if(self.connectStatusInner == WKConnected) {
+        return;
+    }
+    [self reconnect];
 }
 
 #pragma mark ---  GCDAsyncSocketDelegate
@@ -720,6 +853,9 @@ static dispatch_queue_t _imsocketQueue;
    
     // 重连次数归0
     self.reconnectCount = 0;
+    self.addrRetryCount = 0;
+    // 已连接，取消排队中的退避重连
+    [self cancelBackoffReconnect];
     
     // 开始心跳
     [self startHeartbeat];

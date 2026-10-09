@@ -1125,9 +1125,14 @@
 
 -(void) completePullMessages:(NSArray<WKMessage*>*)messages error:(NSError*)error complete:(void(^)(NSArray<WKMessage*> *messages,NSError *error))complete{
     
+    // 修复(issue #2)：messages 为空时 sortMessages:nil 会让回调收到 nil，调用方未判空会崩溃
+    if(!messages) {
+        messages = @[];
+    }
     [self fillReaction:messages];
     [self fillReplyRevoke:messages];
-    complete([self sortMessages:messages],nil);
+    // 修复：原实现始终把 error 吞成 nil，调用方无法感知失败
+    complete([self sortMessages:messages],error);
     
     
 }

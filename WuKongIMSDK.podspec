@@ -40,7 +40,7 @@ Pod::Spec.new do |s|
   s.source_files = 'WuKongIMSDK/Classes/**/*'
   s.public_header_files =  'WuKongIMSDK/Classes/**/*.h'
   s.private_header_files = 'WuKongIMSDK/Classes/private/**/*.h'
-  s.frameworks = 'UIKit', 'MapKit', 'Security'
+  s.frameworks = 'UIKit', 'MapKit', 'Security', 'SystemConfiguration'
 #  s.xcconfig = {
 #      'ENABLE_BITCODE' => 'NO',
 #      "OTHER_LDFLAGS" => "-ObjC"

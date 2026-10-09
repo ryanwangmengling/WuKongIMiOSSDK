@@ -18,6 +18,7 @@ typedef enum : NSUInteger {
     WKPullingOffline, // 拉取离线中
     WKConnected, // 已建立连接
     WKDisconnected, // 断开连接
+    WKNoNetwork,    // 无网络（移植 Android NetworkChecker 的 noNetwork 状态）
 } WKConnectStatus;
 
 

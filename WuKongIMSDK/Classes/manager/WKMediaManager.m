@@ -137,12 +137,14 @@ static WKMediaManager *_instance;
     if(callback) {
         [downloadTask addListener:^{
             dispatch_async(dispatch_get_main_queue(), ^{
-                if(weakTask.status == WKTaskStatusProgressing) {
-                    callback(WKMediaDownloadStateProcessing,weakTask.progress,nil);
-                }else if(weakTask.status == WKTaskStatusError){
+                // 修复(issue #3)：原实现只判断 Progressing/Error，Wait/Suspend/Cancel 等
+                // 状态都会误报 WKMediaDownloadStateSuccess。改为显式判断成功态。
+                if(weakTask.status == WKTaskStatusSuccess) {
+                     callback(WKMediaDownloadStateSuccess,weakTask.progress,weakTask.error);
+                }else if(weakTask.status == WKTaskStatusError || weakTask.status == WKTaskStatusCancel){
                      callback(WKMediaDownloadStateFail,0,weakTask.error);
-                }else {
-                     callback(WKMediaDownloadStateSuccess,0,weakTask.error);
+                }else { // Wait / Progressing / Suspend 视为处理中
+                     callback(WKMediaDownloadStateProcessing,weakTask.progress,nil);
                 }
             });
             
