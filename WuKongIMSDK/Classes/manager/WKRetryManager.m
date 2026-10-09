@@ -31,6 +31,8 @@
 // 运行代际：start/stop 自增，用于作废尚未执行的定时器创建块
 // （原实现「stop 后 main-queue 里排队的 scheduledTimer 仍会执行」，会留下永不失效的 NSTimer）
 @property(atomic,assign) int runGeneration;
+// 过期消息检查是否正在执行（Round 16：检查已移出主线程，防重入，避免耗时超过检查间隔时并发删除同一批消息）
+@property(atomic,assign) BOOL expireChecking;
 
 @end
 @implementation WKRetryManager
@@ -178,13 +180,35 @@ static WKRetryManager *_instance;
 }
 
 -(void) startExpireMsgCheck {
-   NSArray<WKMessage*> *messages = [WKMessageDB.shared getExpireMessages:WKSDK.shared.options.expireMsgLimit];
-    if(messages && messages.count>0) {
-        for (WKMessage *message in messages) {
-            [WKSDK.shared.chatManager deleteMessage:message];
-        }
-        
+    // Round 16：DB 查询 + 删除整段移出主线程，避免每次检查都卡 UI（延续 Android 68d3e6f「DB 操作移后台」精神）
+    if(self.expireChecking) { // 防重入：一次检查可能长于 expireMsgCheckInterval
+        return;
     }
+    self.expireChecking = YES;
+    int generation = self.runGeneration; // 代际快照：stop（登出/切换用户）后作废本次检查
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        typeof(self) strongSelf = weakSelf;
+        if(!strongSelf) {
+            return;
+        }
+        @try {
+            if(strongSelf.runGeneration != generation || !strongSelf.started) {
+                return;
+            }
+            NSArray<WKMessage*> *messages = [WKMessageDB.shared getExpireMessages:WKSDK.shared.options.expireMsgLimit];
+            if(messages && messages.count>0) {
+                for (WKMessage *message in messages) {
+                    if(strongSelf.runGeneration != generation) { // 检查途中 stop，立即中止，避免误删新账号数据
+                        break;
+                    }
+                    [WKSDK.shared.chatManager deleteMessage:message];
+                }
+            }
+        } @finally {
+            strongSelf.expireChecking = NO;
+        }
+    });
 }
 
 -(void) startMessageRetry {

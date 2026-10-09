@@ -101,8 +101,8 @@
 #define SQL_MESSAGE_DELETE_MAXMESSAGESEQ_CONTAIN [NSString stringWithFormat:@"update  %@ set is_deleted=1 where channel_id=? and channel_type=? and message_seq<=?",TB_MESSAGE]
 // 获取频道的最后一条消息
 #define SQL_MESSAGE_LASTMESSAGE_WITH_CHANNEL [NSString stringWithFormat:@"select message.*,%@ from  %@ left join message_extra on message.message_id=message_extra.message_id where message.channel_id=? and message.channel_type=? and message.is_deleted=0 and message.content_type<>99 order by  message.order_seq  desc limit 1",SQL_EXTRA_COLS,TB_MESSAGE]
-// 根据消息ID获取消息
-#define SQL_MESSAGE_WITH_MESSAGEID [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where message.message_id=?",SQL_EXTRA_COLS,TB_MESSAGE]
+// 根据消息ID获取消息（过滤已删除消息，对应 Android eb54d0f：修改通过msgID查询消息时未过滤已被删除消息）
+#define SQL_MESSAGE_WITH_MESSAGEID [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where message.message_id=? and message.is_deleted=0",SQL_EXTRA_COLS,TB_MESSAGE]
 
 // 根据消息ID获取消息
 #define SQL_MESSAGE_WITH_MESSAGEIDOrClientMsgNo [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where (message.message_id<>0 and message.message_id=?) or (message.client_msg_no<>'' and message.client_msg_no=?)",SQL_EXTRA_COLS,TB_MESSAGE]

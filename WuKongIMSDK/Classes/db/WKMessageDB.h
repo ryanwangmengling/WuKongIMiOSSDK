@@ -136,10 +136,10 @@ NS_ASSUME_NONNULL_BEGIN
 // 获取大于指定orderSeq 有messageSeq的第一条消息
 -(WKMessage*) getMessage:(WKChannel*)channel moreThanAndFirstMessageSeq:(uint32_t)orderSeq;
 /**
- 通过消息ID获取消息
+ 通过消息ID获取消息（已删除的消息不返回，对应 Android eb54d0f）
 
  @param messageId <#messageId description#>
- @return <#return value description#>
+ @return 消息，不存在或已删除时返回 nil
  */
 -(WKMessage*) getMessageWithMessageId:(uint64_t)messageId;
 

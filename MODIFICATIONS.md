@@ -569,6 +569,47 @@ Round 14 收尾了「连接层」。本轮沿 R6 打过补丁的发送/重发入
 
 ---
 
+## Round 16 — 已删除消息的查询过滤 + 过期消息检查移出主线程（对应 Android eb54d0f / 68d3e6f）（2026-10-09）
+
+### 16.1 背景
+延续 Round 15.5 的待办往下走，并对照 Android SDK 全量提交重新筛了一遍「尚未移植/尚未判定」的提交，选中 `eb54d0f`（修改通过 msgID 查询消息时未过滤已被删除消息）。Android 的 `MsgDbManager.queryWithMessageID` 对照时为 `... WHERE message_id=? and message.is_deleted=0`，而 iOS 的对应查询没有 `is_deleted` 条件。
+
+### 16.2 改动
+
+**`db/WKMessageDB.m`**
+
+1. **`getMessageWithMessageId:` 会返回已被本地删除的消息**（对应 Android `eb54d0f`）。`SQL_MESSAGE_WITH_MESSAGEID`（`db/WKMessageDB.m:105`）原先只按 `message.message_id=?` 查询；本地删除只是把 `is_deleted` 置 1、行仍在，于是按 messageID 依然能查到已删除的消息。5 个调用点全部期望「拿到在用的消息」：
+   - `manager/WKChatManager.m:361`/`:378`（`editMessage:newContent:` 编辑后刷新 UI、编辑上传完成/失败回调）；
+   - `manager/WKRetryManager.m:251`（内容编辑重试超时）、`:393`（内容编辑上传回调）；
+   - `manager/WKReactionManager.m:50`（`addOrCancelReaction:` 先查消息、再用它的 channel 发送回应）。
+   修复：SQL 加 `and message.is_deleted=0`。效果：对已删除消息不再触发 UI 刷新回调（避免已删除的消息被编辑/重试路径重新推回 UI）；`addOrCancelReaction:` 对已删除消息直接返回（原逻辑会拿已删除消息的 channel 真把回应发上去）。`db/WKMessageDB.h:144` 注释同步写明「已删除返回 nil」。
+
+**`manager/WKRetryManager.m`**
+
+2. **过期消息检查整段跑在主线程**（Round 15.5 遗留；延续 Android `68d3e6f`「DB 操作移后台」精神）。`startExpireMsgCheck` 由 `expireMsgCheckTimer`（主线程，每 `expireMsgCheckInterval`=10s）触发，内部一次 `getExpireMessages:`（join `message_extra` 的 DB 查询）+ 逐条 `deleteMessage:`（DB 标记删除 + 重置最近会话 + 回调 delegate）全在主线程，消息多时明显卡 UI。
+   修复：整段 `dispatch_async` 到全局队列，并加两重保护（`manager/WKRetryManager.m:182-212`）：
+   - `expireChecking`（atomic BOOL）防重入：上一次检查未结束就跳过本轮，避免耗时超过检查间隔时同一批消息被并发删除、`onMessageDeleted:` 重复回调；
+   - `runGeneration` 代际快照：进入前与逐条删除前都比对，`stop`（登出/切换用户）后立即中止，避免用旧库查到的 clientSeq 去删新账号的数据。
+
+### 16.3 Round 15.5 的前提已核实（因此才可以移后台）
+Round 15.5 的顾虑是「`deleteMessage:` 会动 `WKConversationManager` 的内存会话缓存」。本轮核实：`WKConversationManager` **没有内存会话缓存**（`manager/WKConversationManager.m` 仅有 `delegates`/`delegateLock`；`getConversation:` :99 直接查 DB 再补提醒项），`WKConversationDB`/`WKReminderDB` 也没有静态缓存，全部经 `WKFMDatabaseQueue` 串行访问；而 `deleteMessage:` 里的两处通知（`WKChatManager.m:1772` `callMessageDeletedDelegate:`、`resetConversationLastMessage:` → `WKConversationManager.m:364` `callOnConversationUpdateDelegate:`）本身都会 dispatch 到主线程。因此整段移后台是安全的。
+
+### 16.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r16 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（日志 `/tmp/wk_build_r16.log`）。本轮未新增文件，无需 `pod install`。
+
+### 16.5 本轮判定「不移植 / 无对应 / 已有覆盖」
+- `922f23a`（发送失败的消息无法显示）：核心是 Android `insertMsgs` 改为「按 messageID 命中即不插入」+ `queryWithMsgIds` 拼 SQL 漏引号。iOS `saveMessages:`（`db/WKMessageDB.m:195`）本来就用 `getMessageWithMessageIdOrClientMsgNo:` 做存在性判断、按 messageID **或** clientMsgNo 去重，`message_id` 是整数参数绑定，无此问题。
+- `f44d6eb`（ReminderDBManager 返回类型编译错误）：iOS 返回 nil 的 `NSArray` 合法且安全（nil 上取 count 为 0），无对应点。
+- `b220233`（同步群成员每页先删全表）：iOS `WKChannelManager.addOrUpdateMembers:`（`manager/WKChannelManager.m:261`）只清内存缓存 + DB upsert，不删表，无此 bug。
+- `836c02e`/`964c918`/`61dd373`/`a7984b8`/`c5f52cd`/`169215b`：仅日志/格式/demo 改动，或无实质状态机修复。
+- `275ebfb`/`305124a`：连接层架构级重构（单线程 Executor + 定时器管理器）；iOS 已有等价的 `reconnectBackoff`/`reconnectGeneration`/`addrGeneration` 防护（R7/R14），不整体移植。
+- `ce924cd`（批量刷新最近会话）：iOS delegate 是逐条 `onRefreshConversationMsg:`，无对应批量接口，移植价值低。
+- `0e8a9b0`（未登录取 DB 数据的报错）：已被 Round 13（数据库不可用防御）覆盖。
+- `65493fa`/`662a559`（VPN 检测，Android 8 专属）、`ce1086b`/`ff7196b`/`4f917b7`/`b3e8e11`/`3904ad5`（新功能）、`ac7e11f`（消息过期时间字段，iOS 早已有 `expire`/`expire_at` 与 `SQL_EXPIRE_MESSAGES`）属新功能/平台专属/已具备。
+
+---
+
 ## 待办（后续轮次）
-- Round 16 候选：复核 `6d9d6ad` 之后剩余的数据库类提交；评估「过期消息清理移到后台」所需的会话缓存线程安全前提；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
+- Round 17 候选：`WKMessageDB.saveMessages:` 的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）；复核 `6d9d6ad` 之后剩余的数据库类提交。
+- `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
