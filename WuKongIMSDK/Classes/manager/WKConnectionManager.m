@@ -77,6 +77,8 @@
 // 获取连接地址失败时的退避算法（原来固定每秒无限重试）
 @property(nonatomic,strong) WKBackoff *addrBackoff;
 @property(atomic,assign) int addrRetryCount; // 跨线程读写
+// 取消排队中的「获取连接地址」重试（断开/已连接/重新发起连接时自增，跨线程读写）
+@property(atomic,assign) int addrGeneration;
 
 // 网络状态（移植 Android NetworkChecker）
 @property(atomic,assign) BOOL networkAvailable; // 跨线程读写
@@ -198,6 +200,10 @@ static dispatch_queue_t _imsocketQueue;
         return;
     }
     
+    // 开始新一轮连接：作废上一次排队中的「获取连接地址」重试，
+    // 否则旧回调可能在本次已连上之后再建一条 socket（connectSocket 会直接替换 self.ssocket）
+    [self cancelGetAddrRetry];
+    
     // 拉取离线消息
     [self changeConnectStatus:WKPullingOffline];
     
@@ -231,8 +237,13 @@ static dispatch_queue_t _imsocketQueue;
     }
     // 开始建立socket连接
     if(self.getConnectAddr) {
+        // 异步的地址提供者可能在断开/已连接之后才回调，用 generation 判断本次请求是否还有效
+        int generation = self.addrGeneration;
         __weak typeof(self) weakSelf = self;
         self.getConnectAddr(^(NSString * _Nonnull addr) {
+            if(generation != weakSelf.addrGeneration) {
+                return;
+            }
             if(!addr || [addr isEqualToString:@""]) {
                 [weakSelf scheduleRetryGetAddr];
                 return;
@@ -259,11 +270,19 @@ static dispatch_queue_t _imsocketQueue;
     }
     long delay = [self.addrBackoff backoff:self.addrRetryCount];
     self.addrRetryCount++;
+    // 取消排队中的重试：延迟期间若已连接/已断开/重新发起连接，本次重试作废
+    int generation = self.addrGeneration;
     if([WKSDK shared].isDebug) {
         NSLog(@"%ld秒后重新获取连接地址.",delay);
     }
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if(generation != weakSelf.addrGeneration) {
+            if([WKSDK shared].isDebug) {
+                NSLog(@"获取连接地址的重试已被取消，忽略本次重试");
+            }
+            return;
+        }
         [weakSelf loopGetAddrToConnect];
     });
 }
@@ -274,6 +293,10 @@ static dispatch_queue_t _imsocketQueue;
     }
     // 修复：无网络时不再发起连接，等网络恢复回调触发
     if(!self.networkAvailable) {
+        return;
+    }
+    // 已主动断开/退出登录时不再发起新连接（异步地址回调可能在断开之后才返回）
+    if(self.forceDisconnect) {
         return;
     }
     // socket 引用的替换在锁内完成；connectToHost 是异步的，不需要把整个连接过程放进锁里
@@ -396,8 +419,9 @@ static dispatch_queue_t _imsocketQueue;
     self.forceDisconnect = force;
     [self.connectStatusLock unlock];
     
-    // 主动断开时取消排队中的退避重连
+    // 主动断开时取消排队中的退避重连与获取地址重试
     [self cancelBackoffReconnect];
+    [self cancelGetAddrRetry];
     
     // 先取局部引用再在锁外 disconnect，避免并发被替换/置空后再用旧 socket
     [self.socketLock lock];
@@ -417,8 +441,9 @@ static dispatch_queue_t _imsocketQueue;
     // 退出登录时清空提醒项内存缓存，防止脏数据跨账号
     [[WKReminderManager shared] clearCache];
     
-    // 退出登录时取消排队中的退避重连
+    // 退出登录时取消排队中的退避重连与获取地址重试
     [self cancelBackoffReconnect];
+    [self cancelGetAddrRetry];
     
     [self.socketLock lock];
     GCDAsyncSocket *socket = self.ssocket;
@@ -490,12 +515,22 @@ static dispatch_queue_t _imsocketQueue;
     }
 }
 
+// 取消排队中的「获取连接地址」重试（已连接/主动断开/重新发起连接时调用）
+-(void) cancelGetAddrRetry {
+    self.addrGeneration++;
+    self.addrRetryCount = 0;
+}
+
 // 启动网络监听（幂等）
 -(void) startNetworkMonitor {
-    if(self.networkMonitorStarted) {
-        return;
+    // check-then-act 加锁：connect 可能从任意线程并发调用，否则会重复 [monitor start]
+    // 并互相覆盖 networkStatusChange 回调（Round 14 并发普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(self.networkMonitorStarted) {
+            return;
+        }
+        self.networkMonitorStarted = YES;
     }
-    self.networkMonitorStarted = YES;
     WKNetworkMonitor *monitor = [WKNetworkMonitor shared];
     __weak typeof(self) weakSelf = self;
     monitor.networkStatusChange = ^(BOOL available) {
@@ -516,8 +551,9 @@ static dispatch_queue_t _imsocketQueue;
         if([WKSDK shared].isDebug) {
             NSLog(@"无网络连接...");
         }
-        // 取消排队中的退避重连，避免无网络空转
+        // 取消排队中的退避重连与获取地址重试，避免无网络空转
         [self cancelBackoffReconnect];
+        [self cancelGetAddrRetry];
         [self stopHeartbeat];
         if(!self.forceDisconnect) {
             [self changeConnectStatus:WKNoNetwork];
@@ -530,8 +566,8 @@ static dispatch_queue_t _imsocketQueue;
     }
     // 参考 Android NetworkChecker：网络恢复时重置重连计数，给予完整的重连机会
     self.reconnectCount = 0;
-    self.addrRetryCount = 0;
     [self cancelBackoffReconnect];
+    [self cancelGetAddrRetry];
     if(self.forceDisconnect || ![WKSDK shared].options.hasLogin) {
         return;
     }
@@ -882,7 +918,10 @@ static dispatch_queue_t _imsocketQueue;
                     [self disconnect:NO];
                 }
             }
-            return;
+            // 修复：原来这里直接 return，若一次 TCP 读取里 connack 后面还有粘包（服务器常把
+            // connack 与离线消息写在同一段），后续包会被整批丢掉。改为 continue 继续处理剩余包；
+            // 此时 pullOfflineFinished 仍为 NO，剩余包会进临时包数组，等同步完成后再按序处理。
+            continue;
         } else if([packet header].packetType == WK_DISCONNECT) { // 断开连接
             if([WKSDK shared].isDebug) {
                 NSLog(@"收到断开连接的包！客户端将断开！");
@@ -944,9 +983,9 @@ static dispatch_queue_t _imsocketQueue;
    
     // 重连次数归0
     self.reconnectCount = 0;
-    self.addrRetryCount = 0;
-    // 已连接，取消排队中的退避重连
+    // 已连接，取消排队中的退避重连与获取地址重试
     [self cancelBackoffReconnect];
+    [self cancelGetAddrRetry];
     
     // 开始心跳
     [self startHeartbeat];

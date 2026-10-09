@@ -52,49 +52,73 @@ static void WKNetworkReachabilityCallback(SCNetworkReachabilityRef target, SCNet
 }
 
 - (void)start {
-    if(self.started) {
-        return;
-    }
-    self.started = YES;
+    // start/stop 可能从任意线程调用（connect 在调用线程执行、网络回调在主线程），
+    // check-then-act 必须串行，否则会重复创建 SCNetworkReachabilityRef 并泄漏，
+    // 同时把 started 置位但只保留最后一个 ref（Round 14 并发普查，对应 Android 2585602）。
+    SCNetworkReachabilityFlags flags = 0;
+    BOOL needProbe = NO;
+    @synchronized (self) {
+        if(self.started) {
+            return;
+        }
+        self.started = YES;
 
-    // 监听 0.0.0.0 表示「通用网络可达性」，不依赖具体主机
-    struct sockaddr_in zeroAddress;
-    bzero(&zeroAddress, sizeof(zeroAddress));
-    zeroAddress.sin_len = sizeof(zeroAddress);
-    zeroAddress.sin_family = AF_INET;
-    SCNetworkReachabilityRef ref = SCNetworkReachabilityCreateWithAddress(kCFAllocatorDefault, (const struct sockaddr *)&zeroAddress);
-    if(!ref) {
-        return;
-    }
-    self.reachabilityRef = ref;
+        // 监听 0.0.0.0 表示「通用网络可达性」，不依赖具体主机
+        struct sockaddr_in zeroAddress;
+        bzero(&zeroAddress, sizeof(zeroAddress));
+        zeroAddress.sin_len = sizeof(zeroAddress);
+        zeroAddress.sin_family = AF_INET;
+        SCNetworkReachabilityRef ref = SCNetworkReachabilityCreateWithAddress(kCFAllocatorDefault, (const struct sockaddr *)&zeroAddress);
+        if(!ref) {
+            // 创建失败不算已启动，下次调用可重试
+            self.started = NO;
+            return;
+        }
+        self.reachabilityRef = ref;
 
-    SCNetworkReachabilityContext context = {0, (__bridge void *)self, NULL, NULL, NULL};
-    if(SCNetworkReachabilitySetCallback(ref, WKNetworkReachabilityCallback, &context)) {
-        SCNetworkReachabilitySetDispatchQueue(ref, dispatch_get_main_queue());
+        SCNetworkReachabilityContext context = {0, (__bridge void *)self, NULL, NULL, NULL};
+        if(SCNetworkReachabilitySetCallback(ref, WKNetworkReachabilityCallback, &context)) {
+            SCNetworkReachabilitySetDispatchQueue(ref, dispatch_get_main_queue());
+        }
+        // 启动时立即探测一次当前状态（回调在锁外触发，避免持锁调用外部代码）
+        if(SCNetworkReachabilityGetFlags(ref, &flags)) {
+            needProbe = YES;
+        }
     }
-    // 启动时立即探测一次当前状态
-    SCNetworkReachabilityFlags flags;
-    if(SCNetworkReachabilityGetFlags(ref, &flags)) {
+    if(needProbe) {
         [self handleReachabilityFlags:flags];
     }
 }
 
 - (void)stop {
-    if(self.reachabilityRef) {
-        SCNetworkReachabilitySetDispatchQueue(self.reachabilityRef, NULL);
-        SCNetworkReachabilitySetCallback(self.reachabilityRef, NULL, NULL);
-        CFRelease(self.reachabilityRef);
-        self.reachabilityRef = NULL;
+    @synchronized (self) {
+        if(self.reachabilityRef) {
+            SCNetworkReachabilitySetDispatchQueue(self.reachabilityRef, NULL);
+            SCNetworkReachabilitySetCallback(self.reachabilityRef, NULL, NULL);
+            CFRelease(self.reachabilityRef);
+            self.reachabilityRef = NULL;
+        }
+        self.started = NO;
     }
-    self.started = NO;
+}
+
+// 跨线程读取当前网络状态（写入在 handleReachabilityFlags 的锁内）
+- (BOOL)isNetworkAvailable {
+    @synchronized (self) {
+        return _isNetworkAvailable;
+    }
 }
 
 - (void)handleReachabilityFlags:(SCNetworkReachabilityFlags)flags {
     BOOL available = [self reachableWithFlags:flags];
-    if(available == self.isNetworkAvailable) {
-        return;
+    // 判断+赋值放进锁内（可达性回调在主线程、启动探测可能在任意线程）；
+    // 通知在锁外执行，避免持锁调用外部回调。
+    @synchronized (self) {
+        if(available == _isNetworkAvailable) {
+            return;
+        }
+        _isNetworkAvailable = available;
     }
-    self.isNetworkAvailable = available;
     __weak typeof(self) weakSelf = self;
     void(^notify)(void) = ^{
         if(weakSelf.networkStatusChange) {

@@ -489,6 +489,41 @@ iOS 复核结论：
 
 ---
 
+## Round 14 — 连接层：消息完整性 + 重复连接防护 + 网络监听线程安全（对应 Android 2585602 等）（2026-10-09）
+
+### 14.1 背景
+Round 7 已把连接层的门闸（backoff 重连）与 tempPackets 做了并发加固，但 `loopGetAddrToConnect` / `connectSocket` / `WKNetworkMonitor` 这条「拿地址 → 建 socket」的链路还没查过。本轮专门交叉复查该链路与解包后的包分发，找出 4 个真实问题。
+
+### 14.2 改动
+`manager/WKConnectionManager.m`
+
+1. **connack 之后的粘包会被整批丢掉**（`handlePacketData:`）。原来收到 `WK_CONNACK` 处理完连接成功后直接 `return`；而 `unpacket:` 一次 TCP 读取会解出同一段里的**所有**完整包，服务器常把 connack 与紧随其后的离线消息写在同一段，于是 connack 后面的包全部丢失。改为 `continue` 继续处理剩余包；此时 `pullOfflineFinished` 仍为 NO，剩余包会进临时包数组，等会话同步完成后按序处理。
+
+2. **过期的「获取连接地址」重试会再建一条 socket**。`scheduleRetryGetAddr` 用 `dispatch_after` 延迟重试，延迟期间若已经连上（网络恢复触发的立即重连）或已重新发起连接，旧回调仍会执行 `loopGetAddrToConnect` → `connectSocket:`，而 `connectSocket:` 会**直接替换** `self.ssocket`（旧 socket 的断开因 `isCurrentSocket == NO` 被忽略），造成重复连接/连接互相踢。修复：
+   - 新增 `addrGeneration`（atomic int）+ `cancelGetAddrRetry`（`addrGeneration++`、`addrRetryCount = 0`）。
+   - `scheduleRetryGetAddr` 与 `loopGetAddrToConnect` 的 `getConnectAddr` 异步回调都先取 generation 快照，回调/延迟触发时 generation 变了就放弃（异步地址提供者在断开后才返回的场景也一并覆盖）。
+   - `onlyConnect`（新一轮连接开始）、`disconnect:`、`logout`、`handleConnected`、`onNetworkStatusChange:`（有网/无网两条路）都调用 `cancelGetAddrRetry`。
+   - `connectSocket:` 补 `if(self.forceDisconnect) return;`：已主动断开/退出登录后不再发起新连接（异步地址回调可能晚于 logout 返回）。
+
+3. **`startNetworkMonitor` 的 check-then-act 竞态**：`connect` 可从任意线程并发调用，两个线程可能都通过 `networkMonitorStarted` 判断，重复 `[monitor start]` 并互相覆盖 `networkStatusChange` 回调。改为 `@synchronized(self)` 保护判断+置位。
+
+`manager/WKNetworkMonitor.m`
+
+4. **网络监听自身线程安全**：
+   - `start` 整体加 `@synchronized(self)`：避免重复 `SCNetworkReachabilityCreateWithAddress` 造成 ref 泄漏 + 只保留最后一个 ref；`CreateWithAddress` 失败时把 `started` 复位为 NO 以便重试。
+   - 启动时的首次探测改为在锁外调用 `handleReachabilityFlags:`（不持锁调用外部回调）。
+   - `stop` 同一把锁保护 ref 的释放与 `started` 复位。
+   - 新增显式 getter `isNetworkAvailable`（`@synchronized` 读）；`handleReachabilityFlags:` 把「比较+赋值」放进锁内、通知与 `NSNotification` 仍在锁外发出。
+
+### 14.3 判定「已有覆盖 / 不需要移植」
+- `8c3cf3e`（先验证 msgKey 再解密 payload）：iOS 顺序本来就是对的 —— `coder/proto/WKRecvPacket.m:62` 先比对 `msgKey`，`:66` 才 `decryption:`；校验失败直接返回 nil。无需改动。
+- `e91952f`（提醒项内存缓存）：`WKReminderManager` 已有 `reminderCache` + `clearCache`（Round 5 移植，退出登录时清空防跨账号脏数据），无需再动。
+
+### 14.4 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r14 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，0 error；仅有 Pods 的 deployment target 既有告警）。本轮未新增文件，无需 `pod install`。
+
+---
+
 ## 待办（后续轮次）
-- Round 14 候选：`WKConnectionManager` 的 `loopGetAddrToConnect` / 心跳定时器与 delegate 锁的交叉复查；复核 `6d9d6ad` 后剩余的数据库类提交。
+- Round 15 候选：复核 `6d9d6ad` 之后剩余的数据库类提交；`WKChatManager` 的发送/重发与 DB 写入链路交叉复查。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
