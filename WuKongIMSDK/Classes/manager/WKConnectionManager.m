@@ -34,6 +34,10 @@
 
 
 @property(nonatomic,strong) GCDAsyncSocket *ssocket;
+// socket 引用的读写锁（跨线程：socket 队列 / 全局队列 / 主线程）。
+// 使用 NSRecursiveLock：onlyConnect 持锁期间会触发连接状态回调，回调可能重入，
+// 语义与原来误用 `@synchronized(self.ssocket)`（对象锁可重入）保持一致。
+@property(nonatomic,strong) NSRecursiveLock *socketLock;
 
 /**
  *  用来存储所有添加j过的delegate
@@ -134,6 +138,14 @@ static dispatch_queue_t _imsocketQueue;
     return _instance;
 }
 
+// socket 引用读写锁（懒加载，保证任何线程首次访问都拿到同一个锁）
+- (NSRecursiveLock *)socketLock {
+    if (_socketLock == nil) {
+        _socketLock = [[NSRecursiveLock alloc] init];
+    }
+    return _socketLock;
+}
+
 
 // 连接IM服务器
 -(void) connect {
@@ -171,29 +183,31 @@ static dispatch_queue_t _imsocketQueue;
 
 
 -(void) onlyConnect {
-    @synchronized (self.ssocket) {
-         if(self.connectStatusInner == WKConnected ||  self.connectStatusInner == WKConnecting) {
-              if([WKSDK shared].isDebug) {
-                  NSLog(@"已建立连接或在连接中，不再执行连接！");
-              }
-              return;
-          }
-          
-           // 拉取离线消息
-          [self changeConnectStatus:WKPullingOffline];
-        
-           self.pullOfflineFinished = false; // 还没有拉取离线
-          // 状态变为：连接中...
-          [self changeConnectStatus:WKConnecting];
-          
-        if(self.ssocket) {
-            self.ssocket.delegate = nil;
-            self.ssocket = nil;
-          }
-          // 循环去拿连接地址，直到拿到地址
-          [self loopGetAddrToConnect];
-        
+    // 用稳定的 socketLock 保护 socket 引用（原来 `@synchronized(self.ssocket)` 在 ssocket 为 nil 时等于没加锁，
+    // 且锁对象本身会被替换，起不到互斥作用。对应 Android dccdc56 的 connectionLock）
+    [self.socketLock lock];
+    if(self.connectStatusInner == WKConnected ||  self.connectStatusInner == WKConnecting) {
+        [self.socketLock unlock];
+        if([WKSDK shared].isDebug) {
+            NSLog(@"已建立连接或在连接中，不再执行连接！");
+        }
+        return;
     }
+    
+    // 拉取离线消息
+    [self changeConnectStatus:WKPullingOffline];
+    
+    self.pullOfflineFinished = false; // 还没有拉取离线
+    // 状态变为：连接中...
+    [self changeConnectStatus:WKConnecting];
+    
+    if(self.ssocket) {
+        self.ssocket.delegate = nil;
+        self.ssocket = nil;
+    }
+    [self.socketLock unlock];
+    // 循环去拿连接地址，直到拿到地址（在锁外执行，避免与 connectSocket 内的加锁互相阻塞）
+    [self loopGetAddrToConnect];
 }
 
 -(void) loopGetAddrToConnect {
@@ -258,9 +272,13 @@ static dispatch_queue_t _imsocketQueue;
     if(!self.networkAvailable) {
         return;
     }
-    self.ssocket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:_imsocketQueue];
+    // socket 引用的替换在锁内完成；connectToHost 是异步的，不需要把整个连接过程放进锁里
     NSError *error=nil;
-    [self.ssocket connectToHost:host onPort:port error:&error];
+    [self.socketLock lock];
+    GCDAsyncSocket *socket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:_imsocketQueue];
+    self.ssocket = socket;
+    [socket connectToHost:host onPort:port error:&error];
+    [self.socketLock unlock];
     if(error) {
         NSLog(@"连接IM服务器失败-> %@",error);
         // 状态变为：已断开
@@ -377,7 +395,11 @@ static dispatch_queue_t _imsocketQueue;
     // 主动断开时取消排队中的退避重连
     [self cancelBackoffReconnect];
     
-    [self.ssocket disconnect];
+    // 先取局部引用再在锁外 disconnect，避免并发被替换/置空后再用旧 socket
+    [self.socketLock lock];
+    GCDAsyncSocket *socket = self.ssocket;
+    [self.socketLock unlock];
+    [socket disconnect];
     
 }
 
@@ -392,7 +414,10 @@ static dispatch_queue_t _imsocketQueue;
     // 退出登录时取消排队中的退避重连
     [self cancelBackoffReconnect];
     
-    [self.ssocket disconnect];
+    [self.socketLock lock];
+    GCDAsyncSocket *socket = self.ssocket;
+    [self.socketLock unlock];
+    [socket disconnect];
 }
 
 // 重连
@@ -531,6 +556,20 @@ static dispatch_queue_t _imsocketQueue;
 }
 
 - (void)socketDidDisconnect:(GCDAsyncSocket *)sock withError:(nullable NSError *)err {
+    // 并发替换 socket 时，已被替换掉的旧 socket 也会回调到这里；
+    // 只有当前持有的 socket 断开才需要改状态/触发重连，否则旧 socket 的断开会把新连接误判为断开。
+    [self.socketLock lock];
+    BOOL isCurrentSocket = (sock == self.ssocket);
+    if(isCurrentSocket) {
+        self.ssocket = nil;
+    }
+    [self.socketLock unlock];
+    if(!isCurrentSocket) {
+        if([WKSDK shared].isDebug) {
+            NSLog(@"忽略已过期的旧连接断开 -> %@",err);
+        }
+        return;
+    }
     NSLog(@"IM连接已断开 -> %@",err);
      self.tempBufferData = [[NSMutableData alloc] init]; // 清楚缓存数据
     // 状态变为：已断开
@@ -616,7 +655,15 @@ static dispatch_queue_t _imsocketQueue;
 }
 
 -(void) writeData:(NSData*) data {
-    [self.ssocket writeData:data withTimeout:1 tag:0];
+    if(!data) {
+        return;
+    }
+    // 先取局部引用再写，避免并发 disconnect/替换 socket 后把数据写到已失效的连接上
+    // （对应 Android dccdc56 中先取 currentConnection 再判空/使用）
+    [self.socketLock lock];
+    GCDAsyncSocket *socket = self.ssocket;
+    [self.socketLock unlock];
+    [socket writeData:data withTimeout:1 tag:0];
 }
 
 - (NSLock *)delegateLock {

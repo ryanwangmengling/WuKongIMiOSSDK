@@ -276,5 +276,36 @@
 
 ---
 
+## Round 8 — 连接句柄并发安全（socket 引用加锁）（2026-10-09）
+
+> 背景：Android `dccdc56`（「修改连接anr问题」）与 `16c6ca8` 的连接管理规则（连接引用的访问统一放到 `connectionLock` 内，先取局部 `currentConnection` 再判空/使用）。iOS 侧原来的互斥写法是 `@synchronized (self.ssocket)`，存在三个问题：(1) `ssocket` 为 nil 时 `@synchronized(nil)` 是**空操作**，等于没有加锁；(2) 锁对象本身会被替换（`connectSocket:` 新建、`onlyConnect` 置空），不同线程可能锁在不同的对象上，互斥失效；(3) `writeData:` 完全无锁读取 `ssocket`。
+
+### 8.1 引入稳定的 socketLock，socket 引用读写全部加锁
+- **文件**: `WuKongIMSDK/Classes/manager/WKConnectionManager.m`（新增 `socketLock` 属性与懒加载 getter；`onlyConnect`、`connectSocket:port:`、`disconnect:`、`logout`、`writeData:`）
+- **问题**: 多个线程会并发读写 `self.ssocket`：socket 队列（`didConnectToHost`/`didWriteDataWithTag`/`didReadData`）、全局队列（退避重连 → `reconnect` → `onlyConnect`）、主线程（网络恢复回调）、以及 App 线程（`sendPacket:` → `writeData:`）。并发下可能出现：对已 disconnect/已替换的旧 socket 写数据（消息静默丢失）、`onlyConnect` 的「判状态 + 替换 socket」被另一线程穿插。
+- **改动**:
+  - 新增 `@property(nonatomic,strong) NSRecursiveLock *socketLock;` 与懒加载 `- (NSRecursiveLock *)socketLock`。用可重入锁是因为 `onlyConnect` 在锁内会调用 `changeConnectStatus:` 触发连接状态回调，回调可能重入，需与原来对象锁（可重入）语义一致。
+  - `onlyConnect`：用 `socketLock` 替换 `@synchronized (self.ssocket)`；持锁完成「已连接/连接中的短路判断 + 状态切换 + 释放旧 socket」，随后**在锁外**调用 `loopGetAddrToConnect`（`connectSocket:` 内部同样要加锁，留在锁内会自锁）。
+  - `connectSocket:port:`：新建 socket、赋值 `self.ssocket`、`connectToHost:` 在锁内；`error` 分支保持在锁外。
+  - `disconnect:` / `logout`：锁内取局部 `socket` 引用，锁外 `[socket disconnect]`，避免并发被替换/置空后再用旧 socket。
+  - `writeData:`：补 `data` 的 nil 短路；锁内取局部引用，锁外 `writeData:withTimeout:tag:`。
+- **对应 Android**: `dccdc56`（`WKConnection.sendMessage` / `connectionIsNull` / `closeConnect` 中 `synchronized (connectionLock)`，先取 `currentConnection` 再判空/使用）。
+
+### 8.2 过期 socket 的断连回调不再误判为「当前连接断开」
+- **文件**: `WuKongIMSDK/Classes/manager/WKConnectionManager.m`（`socketDidDisconnect:withError:`）
+- **问题**: 替换 socket 后，旧 socket 的 `socketDidDisconnect:` 仍会回调。原实现无条件把状态置 `WKDisconnected`、停心跳并 `backoffReconnect`，于是旧 socket 的断开会把刚建立的新连接误判为断开，触发多余重连与状态抖动（对应 Android `dccdc56` 想解决的连接状态错乱/卡死）。
+- **改动**: 锁内比较 `sock == self.ssocket`；只有当前 socket 才置空 `self.ssocket` 并继续原有断开处理（状态、心跳、退避重连）；否则按 debug 日志提示「忽略已过期的旧连接断开」并直接 `return`。
+- **对应 Android**: `dccdc56`（`closeConnect` 先在锁内取 `connectionToCloseActual` 再处理）+ `ConnectionClient.onDisconnect` 里基于 attachment（`"close..."`）区分主动关闭与真断开。
+
+### 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r8 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`）。本轮未新增文件，无需 `pod install`。
+
+### 已知未处理（后续轮次）
+- `68d3e6f` / `d005ce6`（Android `MsgManager`：同步频道消息的 DB 写入移至后台线程 + 删除冗余 `queryWithMsgIds`，Bugly#30231 OOM）：iOS 需改 `WKChatManager` 的 `calSync:`/`calSyncForForce:`/`pullMessages:` 回调线程，会改变 `complete` 回调线程语义，风险大，推迟。
+- 提醒项内存缓存（`e91952f`）：同 R6，需同时改所有直读 `WKReminderDB` 的路径。
+- `275ebfb` / `305124a`（Android 连接/定时器大重构，引入 `TimerManager`/`TimerTasks`/`NetworkChecker`）：属架构级重写，明显不能作为单点补丁移植。
+
+---
+
 ## 待办（后续轮次）
-- Round 8 候选：`68d3e6f`/`d005ce6`（同步消息 DB 写入/OOM）、`8c3cf3e`（解码前校验）、提醒项内存缓存（`e91952f`）、复核 `6d9d6ad`/`6a95caf`/`8ec8e49`。
+- Round 9 候选：`68d3e6f`/`d005ce6`（同步消息 DB 写入/OOM）、提醒项内存缓存（`e91952f`）、复核 `a7984b8`/`275ebfb` 的连接状态收敛思路（已判定不能作为单点补丁）、复核 `789faba`（附件消息 type）在 iOS 是否已等价。
