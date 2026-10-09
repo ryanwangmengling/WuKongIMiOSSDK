@@ -255,7 +255,12 @@ static NSArray *FMDBClassesConformingToProtocol(Protocol *protocol)
 - (BOOL)migrateDatabaseToVersion:(uint64_t)version bundle:(NSBundle*)migrationsBundle progress:(void (^)(NSProgress *progress))progressBlock error:(NSError **)error
 {
     
-     if(!_migrationsBundle) [NSException exceptionWithName:NSInternalInconsistencyException reason:@"migrationsBundle is nil" userInfo:nil];
+    // 原代码只创建了异常对象却没有 @throw，且判断发生在赋值之前，resource bundle 缺失时
+    // 迁移会静默返回成功、所有表都不创建（Android 同类问题见 11af5e9）。
+    if(!migrationsBundle) {
+        if(error) *error = [NSError errorWithDomain:WKDBMigrationManagerErrorDomain code:0 userInfo:@{NSLocalizedDescriptionKey: @"migrationsBundle is nil"}];
+        return NO;
+    }
     _migrationsBundle = migrationsBundle;
     BOOL success = YES;
     NSArray *pendingVersions = self.pendingVersions;
@@ -378,8 +383,68 @@ static BOOL WKDBMigrationScanMetadataFromPath(NSString *path, uint64_t *version,
 - (BOOL)migrateDatabase:(FMDatabase *)database error:(out NSError *__autoreleasing *)error
 {
     BOOL success = [database executeStatements:self.SQL];
-    if (!success && error) *error = database.lastError;
-    return success;
+    if (success) return YES;
+    // 在已有表结构上重跑迁移（DB 文件损坏后的修复场景）时，CREATE TABLE / ALTER TABLE 会因
+    // 对象已存在而让 sqlite3_exec 中途失败。回退为逐条执行并容忍“已存在”类错误，
+    // 尽量补齐缺失的表/索引（移植 Android 11af5e9 的“每条 SQL try-catch”）。
+    return [self executeStatementsToleratingErrors:database error:error];
+}
+
+// 按语句拆分 SQL；用 -- +migrate StatementBegin/End 标记保护 CREATE TRIGGER 内部的 ';'
+- (NSArray<NSString *> *)splitSQLStatements
+{
+    NSMutableArray<NSString *> *result = [NSMutableArray array];
+    NSMutableString *current = [NSMutableString string];
+    BOOL inStatementBlock = NO;
+    NSArray<NSString *> *lines = [self.SQL componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    for (NSString *line in lines) {
+        if ([line rangeOfString:@"+migrate StatementBegin"].location != NSNotFound) {
+            inStatementBlock = YES;
+            continue;
+        }
+        if ([line rangeOfString:@"+migrate StatementEnd"].location != NSNotFound) {
+            inStatementBlock = NO;
+            NSString *stmt = [current stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (stmt.length > 0) [result addObject:stmt];
+            [current setString:@""];
+            continue;
+        }
+        if (inStatementBlock) {
+            [current appendString:line];
+            [current appendString:@"\n"];
+            continue;
+        }
+        NSArray<NSString *> *parts = [line componentsSeparatedByString:@";"];
+        for (NSUInteger i = 0; i < parts.count; i++) {
+            [current appendString:parts[i]];
+            if (i < parts.count - 1) {
+                NSString *stmt = [current stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (stmt.length > 0) [result addObject:stmt];
+                [current setString:@""];
+            }
+        }
+        [current appendString:@"\n"];
+    }
+    NSString *tail = [current stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (tail.length > 0) [result addObject:tail];
+    return result;
+}
+
+- (BOOL)executeStatementsToleratingErrors:(FMDatabase *)database error:(NSError *__autoreleasing *)error
+{
+    BOOL allOK = YES;
+    for (NSString *statement in [self splitSQLStatements]) {
+        if (![database executeStatements:statement]) {
+            NSString *message = database.lastError.localizedDescription ?: @"";
+            if ([message containsString:@"already exists"] || [message containsString:@"duplicate column name"]) {
+                continue;
+            }
+            allOK = NO;
+            if (error) *error = database.lastError;
+            break;
+        }
+    }
+    return allOK;
 }
 
 @end

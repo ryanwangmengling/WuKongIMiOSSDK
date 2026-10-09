@@ -47,50 +47,63 @@ static WKDBMigrationManager *_manager;
 }
 
 -(BOOL) needSwitchDB:(NSString*)uid {
-    NSString *dbPrefix = [WKSDK shared].options.dbPrefix;
-    if(![dbPrefix isEqualToString:_currentDBPrefix]) {
-        if(self.currentUid && ![self.currentUid isEqualToString:@""] && [self.currentUid isEqualToString:uid]) {
-               return false;
-           }
+    NSString *dbPrefix = [WKSDK shared].options.dbPrefix ?: @"";
+    @synchronized (self) {
+        // 同一用户且 dbPrefix 未变时复用现有数据库连接。
+        // 原逻辑在 prefix 相同时会错误地返回 YES，导致每次 connect 都关闭并重开 DB。
+        if(self.currentUid && [self.currentUid isEqualToString:uid] && [self.currentDBPrefix isEqualToString:dbPrefix]) {
+            return NO;
+        }
+        return YES;
     }
-   self.currentDBPrefix = dbPrefix;
-    return true;
 }
 
 -(void) switchDB:(NSString*)uid {
-    self.currentUid = uid;
-    if(self.dbQueue) {
-        [self.dbQueue close];
-    }
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-   BOOL isExist = [fileManager fileExistsAtPath: [WKSDK shared].options.dbDir];
-    if(!isExist) {
-        NSError *error;
-        if (![fileManager createDirectoryAtPath:[WKSDK shared].options.dbDir withIntermediateDirectories:YES attributes:nil error:&error]) {
-            NSLog(@"creat Directory Failed:%@",[error localizedDescription]);
+    WKFMDatabaseQueue *oldQueue = nil;
+    WKFMDatabaseQueue *newQueue = nil;
+    NSString *dbKey = uid ?: @"";
+    @synchronized (self) {
+        // 同一用户且前缀未变时直接复用现有连接（needSwitchDB 已前置判断，这里再兜底一次）
+        if(self.dbQueue && self.currentUid && [self.currentUid isEqualToString:dbKey] && [self.currentDBPrefix isEqualToString:([WKSDK shared].options.dbPrefix ?: @"")]) {
+            return;
         }
+        oldQueue = self.dbQueue;
+        self.currentUid = uid;
+        // 重置迁移管理器，避免复用到上一个用户的 FMDatabase 实例
+        _manager = nil;
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        BOOL isExist = [fileManager fileExistsAtPath: [WKSDK shared].options.dbDir];
+        if(!isExist) {
+            NSError *error;
+            if (![fileManager createDirectoryAtPath:[WKSDK shared].options.dbDir withIntermediateDirectories:YES attributes:nil error:&error]) {
+                NSLog(@"creat Directory Failed:%@",[error localizedDescription]);
+            }
+        }
+        NSString *dbPath = [NSString stringWithFormat:@"%@/%@%@.db",[WKSDK shared].options.dbDir,[WKSDK shared].options.dbPrefix,uid];
+        if([WKSDK shared].isDebug) {
+            NSLog(@"数据库路径 -> %@",dbPath);
+        }
+        FMDatabaseQueue *fmdb = [FMDatabaseQueue databaseQueueWithPath:dbPath];
+        newQueue = [WKFMDatabaseQueue databaseQueue:fmdb];
+        // 先安装新队列，再关闭旧队列：旧队列关闭后其 inDatabase/inTransaction 会被 isClosed 短路
+        self.dbQueue = newQueue;
+        self.currentDBPrefix = [WKSDK shared].options.dbPrefix;
     }
-    NSString *dbPath = [NSString stringWithFormat:@"%@/%@%@.db",[WKSDK shared].options.dbDir,[WKSDK shared].options.dbPrefix,uid];
-    if([WKSDK shared].isDebug) {
-        NSLog(@"数据库路径 -> %@",dbPath);
-    }
-    
-    NSString *dbKey = uid;
-    
-    
-//    [WKFMEncryptHelper shared].encryptKey = dbKey;
-//    [[WKFMEncryptHelper shared] unEncryptDatabase:dbPath targetPath:[NSString stringWithFormat:@"%@.tmp.db",dbPath]];
-//
-    
-    FMDatabaseQueue *fmdb = [FMDatabaseQueue databaseQueueWithPath:dbPath];
-  
-    self.dbQueue = [WKFMDatabaseQueue databaseQueue:fmdb] ;
-    [self.dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
+    [newQueue inDatabase:^(FMDatabase * _Nonnull db) {
         [db setKeyWithData:[dbKey dataUsingEncoding:NSUTF8StringEncoding]];
-//        [db setKey:uid];
+        // 开启 WAL，提升读写并发（移植 Android 1a48603/f193f42：PRAGMA 需用 query 方式才能拿到结果）
+        FMResultSet *journalSet = [db executeQuery:@"PRAGMA journal_mode=WAL"];
+        if(journalSet) { [journalSet next]; [journalSet close]; }
+        [db executeUpdate:@"PRAGMA synchronous=NORMAL"];
     }];
     // 合并数据库
     [self migrateDatabase];
+    // 迁移完成后异步关闭旧队列，避免在旧队列事务中被同步 close 阻塞（移植 Android 594ccb2 的延迟关闭）
+    if(oldQueue && oldQueue != newQueue) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [oldQueue close];
+        });
+    }
 }
 -(void) createMigrationsTable{
     [[self dbQueue] inDatabase:^(FMDatabase * _Nonnull db) {
@@ -105,14 +118,47 @@ static WKDBMigrationManager *_manager;
     }];
 }
 -(BOOL) migrateDatabase{
-   [self createMigrationsTable];
-    NSError *error;
-    [_manager migrateDatabase:[self resourceBundle] error:&error];
-    if(error) {
-        NSLog(@"migrateDatabaseToVersion is error 【%@】",error);
+    [self createMigrationsTable];
+    if(!_manager) {
+        NSLog(@"[WKDB] 创建迁移管理器失败，数据库不可用");
         return NO;
     }
-    return YES;
+    NSError *error;
+    BOOL success = [_manager migrateDatabase:[self resourceBundle] error:&error];
+    if(error || !success) {
+        NSLog(@"migrateDatabaseToVersion is error 【%@】",error);
+    }
+    if([self checkCoreTables]) {
+        return success;
+    }
+    // 移植 Android 11af5e9：DB 文件被删除/损坏后，schema_migrations 可能仍记录“已迁移”，
+    // 但核心表实际缺失，导致 "no such table: message"。这里重置迁移记录并容忍错误重跑建表 SQL。
+    NSLog(@"[WKDB] 检测到核心表缺失，重置迁移记录并尝试修复");
+    [[self dbQueue] inDatabase:^(FMDatabase * _Nonnull db) {
+        [db executeUpdate:@"DELETE FROM schema_migrations"];
+    }];
+    NSError *repairError;
+    [_manager migrateDatabase:[self resourceBundle] error:&repairError];
+    BOOL repaired = [self checkCoreTables];
+    if(repaired) {
+        NSLog(@"[WKDB] 数据库核心表修复完成");
+    } else {
+        NSLog(@"[WKDB] 数据库修复失败，核心表仍缺失（error: %@）", repairError);
+    }
+    return repaired;
+}
+
+// 校验核心表是否存在（message/conversation/channel），用于检测损坏的数据库
+-(BOOL) checkCoreTables {
+    __block BOOL ok = NO;
+    WKFMDatabaseQueue *queue = self.dbQueue;
+    if(!queue) {
+        return NO;
+    }
+    [queue inDatabase:^(FMDatabase * _Nonnull db) {
+        ok = [self isExistTable:@"message" db:db] && [self isExistTable:@"conversation" db:db] && [self isExistTable:@"channel" db:db];
+    }];
+    return ok;
 }
 
 - (NSBundle*) resourceBundle{

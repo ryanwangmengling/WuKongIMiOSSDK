@@ -11,6 +11,10 @@
 
 @property(nonatomic,strong) FMDatabaseQueue *queue;
 
+// 关闭后置 YES：所有 DB 入口提前短路，避免在已关闭的队列/连接上继续操作导致崩溃
+// （移植 Android 594ccb2 的 WKDBHelper.isClosed 防御层）
+@property(atomic,assign) BOOL closed;
+
 @end
 
 @implementation WKFMDatabaseQueue
@@ -24,6 +28,7 @@
 
 
 - (void)inDatabase:(void (NS_NOESCAPE^)(FMDatabase * _Nonnull db))block {
+    if(self.closed) { return; }
     
     if([WKSDK shared].options.traceDBLog) {
         NSArray *syms = [NSThread  callStackSymbols];
@@ -43,6 +48,7 @@
 }
 
 - (void)inTransaction:(__attribute__((noescape)) void (^)(FMDatabase *db, BOOL *rollback))block {
+    if(self.closed) { return; }
 
     if([WKSDK shared].options.traceDBLog) {
         NSArray *syms = [NSThread  callStackSymbols];
@@ -60,6 +66,8 @@
 
 
 -(void) close {
+    if(self.closed) { return; }
+    self.closed = YES;
     [self.queue close];
 }
 
