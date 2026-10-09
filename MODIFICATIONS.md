@@ -307,5 +307,42 @@
 
 ---
 
+## Round 9 — 缓存 / 频道管理器并发安全（2026-10-09）
+
+> 背景：Android `35b2d6c`「修改获取频道资料卡的问题」把 `ChannelManager.wkChannelList` 从 `Collections.synchronizedList(new ArrayList<>())` 换成 `CopyOnWriteArrayList`（并发遍历/修改导致的问题），顺便把 `ConversationManager` 的 `saveSyncChat` 从 `new Thread()` 换成 `DispatchQueuePool(3)`；`2585602` 修过「Handler 初始化」等并发安全问题。iOS 侧同类问题集中在缓存与频道管理器：`WKMemoryCache` 完全无锁、`WKChannelManager.fetchChannelInfo:` 的 check-then-act 竞态、以及一批惰性锁 getter 的并发初始化。
+
+### 9.1 WKMemoryCache 全面加锁
+- **文件**: `WuKongIMSDK/Classes/utils/WKMemoryCache.m`
+- **问题**: `cacheDictonary`（`NSMutableDictionary`）与 `cacheArray`（`NSMutableArray`）没有任何同步。该缓存被 `WKChannelManager` 用作频道成员内存缓存（`channelMemberCache`，`maxCacheNum=100000`），读写点分布在主线程 / socket 队列 / DB 回调 / App 线程。并发 `setCache:`/`getCache:` 会崩在 CFDictionary/CFArray 内部；`cleanCache` 里遍历 `cacheArray` 时若有并发 `setCache:` 也会崩。
+- **改动**:
+  - 新增 `NSRecursiveLock *lock`（懒加载）；`setCache:forKey:`、`getCache:` 全部进锁。
+  - 清理逻辑拆出 `cleanCacheLocked`（调用方已持锁），`setCache:` 在锁内调用它；对外保留 `cleanCache` 作为自加锁入口。
+  - `key` 为 nil 直接短路（原实现会把 nil 加进 `cacheArray` 而崩溃）。
+- **对应 Android**: `35b2d6c`（线程安全集合）+ `2585602`（并发安全）。
+
+### 9.2 频道资料请求的 check-then-act 竞态 + 锁外追加
+- **文件**: `WuKongIMSDK/Classes/manager/WKChannelManager.m`（`fetchChannelInfo:completion:`）
+- **问题**:
+  1. 原实现「锁内读 `channelReqeusts[key]` → **锁外** `addObject:` → 再锁内写回」。两个并发请求可能都读到 nil，各自新建数组并互相覆盖：先到者的 completion **永远不被回调**，后到者还会多发一次 `channelInfoUpdate` 请求。
+  2. 锁外 `[blockArray addObject:]` 与回调线程的 `removeObjectForKey:` / 遍历并发，会破坏 `NSMutableArray`（崩溃或丢回调）。
+- **改动**: 把「判重 + 追加 / 新建并登记」整体放进同一把 `channelReqeustLock`；重复请求在锁内追加后返回 nil；新请求在锁内登记后再发起 `channelInfoUpdate`。
+- **对应 Android**: `35b2d6c`（`ChannelManager.wkChannelList` 改线程安全集合）。
+
+### 9.3 惰性锁 / 字典 getter 的并发初始化竞态
+- **文件**: `WuKongIMSDK/Classes/manager/WKChannelManager.m`（`channelReqeusts`、`channelReqeustLock`、`cacheDict`、`cacheDictLock`、`delegateLock`、`delegates` 六个懒加载 getter）
+- **问题**: 两个线程同时首次访问时可能各创建一个锁对象，导致一个线程持 A 锁、另一个持 B 锁，互斥完全失效；字典同理（后者覆盖前者，前者的写入丢失）。
+- **改动**: 初始化整体放进 `@synchronized(self)`（`self` 是单例，锁稳定且可重入）。
+- **对应 Android**: `2585602`（「并发安全问题，包括 Handler 初始化、线程安全计数器、volatile 可见性」）。
+
+### 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r9 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`）。本轮未新增文件，无需 `pod install`。
+
+### 本轮甄别后判定「不移植」
+- `35b2d6c` 的 `ConversationManager` 用 `DispatchQueuePool(3)` 替换 `new Thread()`：iOS 的同步会话已走全局队列/`dispatch_after`，不存在「每条消息新建线程」的问题。
+- `35b2d6c` 的「解密放在 msgKey 校验之后」：iOS `WKRecvPacket.m:60-66` 已先校验再解密（同 R8 对 `8c3cf3e` 的结论）。
+- `b220233`（同步群成员时不再 `deleteWithChannel` 清库）：iOS `addOrUpdateMembers:` 只清内存缓存、DB 走 upsert，无清库行为。
+
+---
+
 ## 待办（后续轮次）
-- Round 9 候选：`68d3e6f`/`d005ce6`（同步消息 DB 写入/OOM）、提醒项内存缓存（`e91952f`）、复核 `a7984b8`/`275ebfb` 的连接状态收敛思路（已判定不能作为单点补丁）、复核 `789faba`（附件消息 type）在 iOS 是否已等价。
+- Round 10 候选：`68d3e6f`/`d005ce6`（同步消息 DB 写入/OOM）、提醒项内存缓存（`e91952f`）、复核 `789faba`（附件消息 type）在 iOS 是否已等价、`ce924cd`（同步最近会话）。

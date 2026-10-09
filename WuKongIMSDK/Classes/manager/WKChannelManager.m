@@ -71,25 +71,25 @@ static WKChannelManager *_instance;
 
 -(WKTaskOperator*) fetchChannelInfo:(WKChannel*) channel completion:(WKChannelInfoBlock)channelInfoBlock {
     NSString *key = [NSString stringWithFormat:@"%@-%d",channel.channelId,channel.channelType];
-    [self.channelReqeustLock lock];
-    NSMutableArray<WKChannelInfoBlock> *blockArray =  self.channelReqeusts[key];
-    [self.channelReqeustLock unlock];
-    if(blockArray && blockArray.count>0) { // 如果有值，则是重复请求，不处理
-        [blockArray addObject:^(WKChannelInfo* channelInfo){
-            if(channelInfoBlock) {
-                channelInfoBlock(channelInfo);
-            }
-        }];
-        return nil;
-    }
-    blockArray = [NSMutableArray array];
-    [blockArray addObject:^(WKChannelInfo* channelInfo){
+    WKChannelInfoBlock wrappedBlock = ^(WKChannelInfo* channelInfo){
         if(channelInfoBlock) {
             channelInfoBlock(channelInfo);
         }
-    }];
-    
+    };
+    // 修复：原来是 check-then-act —— 先在锁内读、锁外 addObject，再在锁内写回。
+    // 两个并发请求可能都读到 nil，各自新建数组后互相覆盖，导致先到的 completion 永远不被回调；
+    // 且锁外 addObject 与回调线程的移除/遍历并发，会破坏 NSMutableArray。
+    // 现把「判断重复 + 追加 / 新建并登记」整体放进同一把锁。
+    // 对应 Android 35b2d6c（ChannelManager.wkChannelList 由 synchronizedList 改用 CopyOnWriteArrayList 的线程安全修复）。
     [self.channelReqeustLock lock];
+    NSMutableArray<WKChannelInfoBlock> *blockArray =  self.channelReqeusts[key];
+    if(blockArray) { // 如果有值，则是重复请求，挂到同一批回调里
+        [blockArray addObject:wrappedBlock];
+        [self.channelReqeustLock unlock];
+        return nil;
+    }
+    blockArray = [NSMutableArray array];
+    [blockArray addObject:wrappedBlock];
     self.channelReqeusts[key] = blockArray;
     [self.channelReqeustLock unlock];
     
@@ -156,16 +156,22 @@ static WKChannelManager *_instance;
     
 }
 
+// 惰性初始化加 @synchronized(self)：否则两个线程可能各建一个锁/字典，
+// 一个线程持有 A 锁、另一个持有 B 锁，互斥失效（对应 Android 2585602 的「Handler 初始化」并发修复）。
 - (NSMutableDictionary *)channelReqeusts {
-    if(!_channelReqeusts) {
-        _channelReqeusts = [NSMutableDictionary dictionary];
+    @synchronized (self) {
+        if(!_channelReqeusts) {
+            _channelReqeusts = [NSMutableDictionary dictionary];
+        }
     }
     return _channelReqeusts;
 }
 
 - (NSLock *)channelReqeustLock {
-    if(!_channelReqeustLock) {
-        _channelReqeustLock = [[NSLock alloc] init];
+    @synchronized (self) {
+        if(!_channelReqeustLock) {
+            _channelReqeustLock = [[NSLock alloc] init];
+        }
     }
     return _channelReqeustLock;
 }
@@ -429,29 +435,37 @@ static WKChannelManager *_instance;
 }
 
 - (NSLock *)delegateLock {
-    if (_delegateLock == nil) {
-        _delegateLock = [[NSLock alloc] init];
+    @synchronized (self) {
+        if (_delegateLock == nil) {
+            _delegateLock = [[NSLock alloc] init];
+        }
     }
     return _delegateLock;
 }
 
 -(NSHashTable*) delegates {
-    if (_delegates == nil) {
-        _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+    @synchronized (self) {
+        if (_delegates == nil) {
+            _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+        }
     }
     return _delegates;
 }
 
 -(NSMutableDictionary*) cacheDict {
-    if(!_cacheDict) {
-        _cacheDict = [[NSMutableDictionary alloc] init];
+    @synchronized (self) {
+        if(!_cacheDict) {
+            _cacheDict = [[NSMutableDictionary alloc] init];
+        }
     }
     return _cacheDict;
 }
 
 -(NSLock*) cacheDictLock {
-    if(!_cacheDictLock) {
-        _cacheDictLock = [[NSLock alloc] init];
+    @synchronized (self) {
+        if(!_cacheDictLock) {
+            _cacheDictLock = [[NSLock alloc] init];
+        }
     }
     return _cacheDictLock;
 }
