@@ -141,10 +141,13 @@ static dispatch_queue_t _imsocketQueue;
 
 // socket 引用读写锁（懒加载，保证任何线程首次访问都拿到同一个锁）
 - (NSRecursiveLock *)socketLock {
-    if (_socketLock == nil) {
-        _socketLock = [[NSRecursiveLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if (_socketLock == nil) {
+            _socketLock = [[NSRecursiveLock alloc] init];
+        }
+        return _socketLock;
     }
-    return _socketLock;
 }
 
 
@@ -670,10 +673,13 @@ static dispatch_queue_t _imsocketQueue;
 }
 
 - (NSLock *)delegateLock {
-    if (_delegateLock == nil) {
-        _delegateLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if (_delegateLock == nil) {
+            _delegateLock = [[NSLock alloc] init];
+        }
+        return _delegateLock;
     }
-    return _delegateLock;
 }
 
 -(void) addDelegate:(id<WKConnectionManagerDelegate>) delegate{

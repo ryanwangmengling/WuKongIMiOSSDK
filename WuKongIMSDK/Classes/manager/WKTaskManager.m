@@ -87,17 +87,23 @@
 }
 
 -(NSMutableDictionary*) taskDic {
-    if(!_taskDic) {
-        _taskDic = [[NSMutableDictionary alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_taskDic) {
+            _taskDic = [[NSMutableDictionary alloc] init];
+        }
+        return _taskDic;
     }
-    return _taskDic;
 }
 
 - (NSLock *)taskLock {
-    if(!_taskLock) {
-        _taskLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_taskLock) {
+            _taskLock = [[NSLock alloc] init];
+        }
+        return _taskLock;
     }
-    return _taskLock;
 }
 
 @end

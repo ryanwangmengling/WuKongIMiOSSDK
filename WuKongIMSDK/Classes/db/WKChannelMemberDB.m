@@ -371,10 +371,13 @@ static WKChannelMemberDB *_instance;
 
 
 - (NSLock *)memberLock {
-    if(!_memberLock) {
-        _memberLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_memberLock) {
+            _memberLock = [[NSLock alloc] init];
+        }
+        return _memberLock;
     }
-    return _memberLock;
 }
 
 -(NSString*) extraToStr:(NSDictionary*)extra {

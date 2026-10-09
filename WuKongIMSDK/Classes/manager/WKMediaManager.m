@@ -335,10 +335,13 @@ static WKMediaManager *_instance;
 #pragma mark - 声明委托
 
 - (NSLock *)delegateLock {
-    if (_delegateLock == nil) {
-        _delegateLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if (_delegateLock == nil) {
+            _delegateLock = [[NSLock alloc] init];
+        }
+        return _delegateLock;
     }
-    return _delegateLock;
 }
 
 -(void) addDelegate:(id<WKMediaManagerDelegate>) delegate{

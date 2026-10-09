@@ -20,10 +20,13 @@
 @implementation WKMemoryCache
 
 - (NSRecursiveLock *)lock {
-    if(!_lock) {
-        _lock = [[NSRecursiveLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_lock) {
+            _lock = [[NSRecursiveLock alloc] init];
+        }
+        return _lock;
     }
-    return _lock;
 }
 
 -(void) setCache:(id)value forKey:(NSString*)key {
@@ -81,17 +84,23 @@
 }
 
 -(NSMutableArray*) cacheArray {
-    if(!_cacheArray) {
-        _cacheArray = [NSMutableArray array];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_cacheArray) {
+            _cacheArray = [NSMutableArray array];
+        }
+        return _cacheArray;
     }
-    return _cacheArray;
 }
 
 -(NSMutableDictionary*) cacheDictonary {
-    if(!_cacheDictonary) {
-        _cacheDictonary = [[NSMutableDictionary alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_cacheDictonary) {
+            _cacheDictonary = [[NSMutableDictionary alloc] init];
+        }
+        return _cacheDictonary;
     }
-    return _cacheDictonary;
 }
 
 @end

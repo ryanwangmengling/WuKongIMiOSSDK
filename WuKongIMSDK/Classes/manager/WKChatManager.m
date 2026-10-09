@@ -517,24 +517,33 @@
 }
 
 - (dispatch_queue_t)ackQueue {
-    if(!_ackQueue) {
-        _ackQueue =dispatch_queue_create("ack", DISPATCH_QUEUE_SERIAL);
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_ackQueue) {
+            _ackQueue =dispatch_queue_create("ack", DISPATCH_QUEUE_SERIAL);
+        }
+        return _ackQueue;
     }
-    return _ackQueue;
 }
 
 - (dispatch_queue_t)handleMessageQueue {
-    if(!_handleMessageQueue) {
-        _handleMessageQueue =dispatch_queue_create("im.wukongim.handleMessageQueue", DISPATCH_QUEUE_CONCURRENT);
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_handleMessageQueue) {
+            _handleMessageQueue =dispatch_queue_create("im.wukongim.handleMessageQueue", DISPATCH_QUEUE_CONCURRENT);
+        }
+        return _handleMessageQueue;
     }
-    return _handleMessageQueue;
 }
 
 - (dispatch_queue_t)sendMessageQueue {
-    if(!_sendMessageQueue) {
-        _sendMessageQueue = dispatch_queue_create("im.wukongim.sendMessage", DISPATCH_QUEUE_CONCURRENT);
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_sendMessageQueue) {
+            _sendMessageQueue = dispatch_queue_create("im.wukongim.sendMessage", DISPATCH_QUEUE_CONCURRENT);
+        }
+        return _sendMessageQueue;
     }
-    return _sendMessageQueue;
 }
 
 - (dispatch_queue_t)syncChannelMessageQueue {
@@ -1590,24 +1599,33 @@
 }
 
 -(NSMutableDictionary*) retryMessageDict {
-    if(!_retryMessageDict) {
-        _retryMessageDict = [[NSMutableDictionary alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_retryMessageDict) {
+            _retryMessageDict = [[NSMutableDictionary alloc] init];
+        }
+        return _retryMessageDict;
     }
-    return _retryMessageDict;
 }
 
 - (NSLock *)delegateLock {
-    if (_delegateLock == nil) {
-        _delegateLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if (_delegateLock == nil) {
+            _delegateLock = [[NSLock alloc] init];
+        }
+        return _delegateLock;
     }
-    return _delegateLock;
 }
 
 -(NSHashTable*) delegates {
-    if (_delegates == nil) {
-        _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if (_delegates == nil) {
+            _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+        }
+        return _delegates;
     }
-    return _delegates;
 }
 
 
@@ -1792,10 +1810,13 @@
 }
 
 - (NSMutableDictionary *)interceptDict {
-    if(!_interceptDict) {
-        _interceptDict = [NSMutableDictionary dictionary];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_interceptDict) {
+            _interceptDict = [NSMutableDictionary dictionary];
+        }
+        return _interceptDict;
     }
-    return _interceptDict;
 }
 
 -(void) addMessageStoreBeforeIntercept:(NSString*)sid intercept:(BOOL(^)(WKMessage*message))interceptBlock {

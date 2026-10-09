@@ -139,24 +139,33 @@ static WKChannelRequestQueue *_instance;
 
 
 - (NSMutableArray<WKChannelRequest *> *)requests {
-    if(!_requests) {
-        _requests = [NSMutableArray array];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_requests) {
+            _requests = [NSMutableArray array];
+        }
+        return _requests;
     }
-    return _requests;
 }
 
 - (NSMutableDictionary *)requestDict {
-    if(!_requestDict) {
-        _requestDict = [NSMutableDictionary dictionary];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_requestDict) {
+            _requestDict = [NSMutableDictionary dictionary];
+        }
+        return _requestDict;
     }
-    return _requestDict;
 }
 
 - (NSRecursiveLock *)lock {
-    if(!_lock) {
-        _lock = [[NSRecursiveLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_lock) {
+            _lock = [[NSRecursiveLock alloc] init];
+        }
+        return _lock;
     }
-    return _lock;
 }
 
 

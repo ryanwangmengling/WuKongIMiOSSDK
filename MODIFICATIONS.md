@@ -407,6 +407,52 @@
 
 ---
 
+## Round 12 — 管理器惰性 getter 并发安全普查（对应 Android 2585602）（2026-10-09）
+
+### 12.1 背景
+R9/R10 已给 `WKMemoryCache`、`WKChannelManager`、`WKReminderManager` 的惰性 getter 加锁。本轮做一次**全库普查**：把所有「可能被多线程访问的管理器/工具类惰性 getter」统一用 `@synchronized(self)` 保护，避免并发首次访问各建一个实例（后建对象覆盖 ivar，先建对象及其中的委托/缓存/任务全部变成孤儿而丢失）。蓝本 Android `2585602`（并发初始化）。
+
+### 12.2 做法
+脚本按「方法声明 + 大括号配对」定位 getter，把 `if(!_x) { _x = [[... alloc] init]; } return _x;` 整段包进 `@synchronized (self) { ... }`。共 **45 处、16 个文件**：
+
+| 文件 | 处数 | getter |
+| --- | --- | --- |
+| `WKSDK.m` | 10 | messageContentDict、messageContentDictLock、options、connectionManager、chatManager、conversationManager、channelManager、bodyCoderManager、cmdManager、coder |
+| `utils/WKMemoryCache.m` | 3 | lock、cacheArray、cacheDictonary |
+| `manager/WKCMDManager.m` | 2 | delegateLock、delegates |
+| `manager/WKChannelRequestQueue.m` | 3 | requests、requestDict、lock |
+| `manager/WKChatManager.m` | 7 | ackQueue、handleMessageQueue、sendMessageQueue、retryMessageDict、delegateLock、delegates、interceptDict |
+| `manager/WKConnectionManager.m` | 2 | socketLock（R8 引入，getter 当时漏锁）、delegateLock |
+| `manager/WKConversationManager.m` | 2 | delegateLock、delegates |
+| `manager/WKMediaManager.m` | 1 | delegateLock |
+| `manager/WKMessageQueueManager.m` | 1 | sendPackets |
+| `manager/WKPinnedMessageManager.m` | 2 | delegateLock、delegates |
+| `manager/WKReactionManager.m` | 2 | delegateLock、delegates |
+| `manager/WKReceiptManager.m` | 2 | cachedLock、cacheDict |
+| `manager/WKRetryManager.m` | 4 | retryLock、retryDict、messageExtraRetryDict、reminderRetryDict |
+| `manager/WKTaskManager.m` | 2 | taskDic、taskLock |
+| `manager/task/WKBaseTask.m` | 1 | listenerDic |
+| `db/WKChannelMemberDB.m` | 1 | memberLock |
+
+### 12.3 为什么危险（举例）
+- `WKConversationManager`/`WKCMDManager`/`WKReactionManager`/`WKPinnedMessageManager` 等的 `delegates` 是 `NSHashTable`：App 常在任意线程 `addDelegate:`，SDK 回调线程同时读；并发首次访问会让其中一份委托表变成孤儿，此后**所有回调都丢**。
+- `WKChatManager` 的三条 `dispatch_queue` 若并发首建，ack / 消息处理 / 发送任务会分散到两个队列，**串行语义被破坏**（与 Round 11 的 `syncChannelMessageQueue` 同类问题）。
+- `WKRetryManager`/`WKReceiptManager`/`WKTaskManager` 的字典若并发首建，部分重试项/回执/任务会写进孤儿字典、永不被处理。
+
+### 12.4 安全性说明
+`@synchronized(self)` 只保护「首次构造」这一段，构造完成后 getter 内部仅读 ivar，开销很小；`@synchronized` 可重入，不会与调用方已持有的原生锁（如 `delegateLock`/`cacheLock`）冲突。本次未改变任何锁的粒度，也未改变既有锁/队列的配对约定。
+
+### 12.5 判定不处理（普查中刻意排除）
+- `db/WKChannelMemberDB.m:72 -extra`：`WKChannelMember` 模型对象的数据容器，随对象单线程使用，非共享状态。
+- `db/WKDB.m:120 -migrateDatabase`：不是惰性 getter，方法体内 `if(!_manager)` 只是判空；迁移本身在 `FMDatabaseQueue` 串行执行。
+- `model/**`、`coder/proto/**` 的惰性 getter（`WKMessage.header/extra`、`WKSendPacket.setting` 等）：模型/协议对象的数据容器，按对象访问。
+
+### 12.6 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r12 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，0 error）。
+- 复查脚本：加锁后全库剩余「未加锁的惰性 getter」仅为上述 2 个刻意排除项（`REMAINING 2`）。本轮未新增文件，无需 `pod install`。
+
+---
+
 ## 待办（后续轮次）
-- Round 12 候选：`WKConversationManager`（`:343-354` 的 `delegateLock`/`delegates` 惰性 getter 无 `@synchronized`，与 R9/R10 同类）以及其它管理器的惰性 getter 并发初始化普查；复核 `6d9d6ad` 的 10 处 DB 事务在 iOS 是否都有防御。
+- Round 13 候选：复核 `6d9d6ad` 的 10 处 DB 事务在 iOS 是否都有防御；`WKConnectionManager` 的 `loopGetAddrToConnect` / 心跳定时器与 delegate 锁的交叉复查。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

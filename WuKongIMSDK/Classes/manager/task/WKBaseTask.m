@@ -56,10 +56,13 @@
 }
 
 - (NSMutableDictionary *)listenerDic {
-    if(!_listenerDic) {
-        _listenerDic = [NSMutableDictionary dictionary];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_listenerDic) {
+            _listenerDic = [NSMutableDictionary dictionary];
+        }
+        return _listenerDic;
     }
-    return _listenerDic;
 }
 
 @end

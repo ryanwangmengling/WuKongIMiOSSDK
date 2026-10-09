@@ -409,31 +409,43 @@ static WKRetryManager *_instance;
 }
 
 -(NSLock*) retryLock {
-    if(!_retryLock) {
-        _retryLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_retryLock) {
+            _retryLock = [[NSLock alloc] init];
+        }
+        return _retryLock;
     }
-    return _retryLock;
 }
 
 -(NSMutableDictionary*)retryDict {
-    if(!_retryDict) {
-        _retryDict = [[NSMutableDictionary alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_retryDict) {
+            _retryDict = [[NSMutableDictionary alloc] init];
+        }
+        return _retryDict;
     }
-    return _retryDict;
 }
 
 - (NSMutableDictionary<NSString *,WKRetryItem *> *)messageExtraRetryDict {
-    if(!_messageExtraRetryDict) {
-        _messageExtraRetryDict = [[NSMutableDictionary alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_messageExtraRetryDict) {
+            _messageExtraRetryDict = [[NSMutableDictionary alloc] init];
+        }
+        return _messageExtraRetryDict;
     }
-    return _messageExtraRetryDict;
 }
 
 - (NSMutableDictionary<NSString *,WKRetryItem *> *)reminderRetryDict {
-    if(!_reminderRetryDict) {
-        _reminderRetryDict = [[NSMutableDictionary alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_reminderRetryDict) {
+            _reminderRetryDict = [[NSMutableDictionary alloc] init];
+        }
+        return _reminderRetryDict;
     }
-    return _reminderRetryDict;
 }
 
 

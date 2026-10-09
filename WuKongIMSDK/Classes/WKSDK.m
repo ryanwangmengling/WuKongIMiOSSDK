@@ -50,29 +50,38 @@ static WKSDK *_instance;
 }
 
 - (NSMutableDictionary *)messageContentDict {
-    if(!_messageContentDict) {
-        _messageContentDict = [[NSMutableDictionary alloc] init];
-        [_messageContentDict setObject:[WKTextContent class] forKey:[NSString stringWithFormat:@"%li",[WKTextContent contentType].longValue]];
-        [_messageContentDict setObject:[WKImageContent class] forKey:[NSString stringWithFormat:@"%li",[WKImageContent contentType].longValue]];
-        [_messageContentDict setObject:[WKVoiceContent class] forKey:[NSString stringWithFormat:@"%li",[WKVoiceContent contentType].longValue]];
-        [_messageContentDict setObject:[WKCMDContent class] forKey:[NSString stringWithFormat:@"%li",[WKCMDContent contentType].longValue]];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_messageContentDict) {
+            _messageContentDict = [[NSMutableDictionary alloc] init];
+            [_messageContentDict setObject:[WKTextContent class] forKey:[NSString stringWithFormat:@"%li",[WKTextContent contentType].longValue]];
+            [_messageContentDict setObject:[WKImageContent class] forKey:[NSString stringWithFormat:@"%li",[WKImageContent contentType].longValue]];
+            [_messageContentDict setObject:[WKVoiceContent class] forKey:[NSString stringWithFormat:@"%li",[WKVoiceContent contentType].longValue]];
+            [_messageContentDict setObject:[WKCMDContent class] forKey:[NSString stringWithFormat:@"%li",[WKCMDContent contentType].longValue]];
         
+        }
+        return _messageContentDict;
     }
-    return _messageContentDict;
 }
 
 - (NSLock *)messageContentDictLock {
-    if(!_messageContentDictLock) {
-        _messageContentDictLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_messageContentDictLock) {
+            _messageContentDictLock = [[NSLock alloc] init];
+        }
+        return _messageContentDictLock;
     }
-    return _messageContentDictLock;
 }
 
 - (WKOptions *)options {
-    if(!_options) {
-        _options = [[WKOptions alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_options) {
+            _options = [[WKOptions alloc] init];
+        }
+        return _options;
     }
-    return _options;
 }
 
 - (void)setConnectURL:(NSString *)connectURL {
@@ -117,38 +126,53 @@ static WKSDK *_instance;
 }
 
 -(WKConnectionManager*) connectionManager{
-    if(!_connectionManager){
-        _connectionManager =[WKConnectionManager sharedManager];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_connectionManager){
+            _connectionManager =[WKConnectionManager sharedManager];
+        }
+        return _connectionManager;
     }
-    return _connectionManager;
 }
 
 -(WKChatManager*) chatManager{
-    if(!_chatManager){
-        _chatManager =[WKChatManager new];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_chatManager){
+            _chatManager =[WKChatManager new];
+        }
+        return _chatManager;
     }
-    return _chatManager;
 }
 
 -(WKConversationManager*) conversationManager {
-    if(!_conversationManager) {
-        _conversationManager = [WKConversationManager new];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_conversationManager) {
+            _conversationManager = [WKConversationManager new];
+        }
+        return _conversationManager;
     }
-    return _conversationManager;
 }
 
 -(WKChannelManager*) channelManager{
-    if(!_channelManager){
-        _channelManager =[WKChannelManager new];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_channelManager){
+            _channelManager =[WKChannelManager new];
+        }
+        return _channelManager;
     }
-    return _channelManager;
 }
 
 -(WKPakcetBodyCoderManager*) bodyCoderManager{
-    if(!_bodyCoderManager){
-        _bodyCoderManager =[WKPakcetBodyCoderManager new];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_bodyCoderManager){
+            _bodyCoderManager =[WKPakcetBodyCoderManager new];
+        }
+        return _bodyCoderManager;
     }
-    return _bodyCoderManager;
 }
 
 - (WKMediaManager *)mediaManager {
@@ -156,10 +180,13 @@ static WKSDK *_instance;
 }
 
 - (WKCMDManager *)cmdManager {
-    if(!_cmdManager) {
-        _cmdManager = [WKCMDManager new];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_cmdManager) {
+            _cmdManager = [WKCMDManager new];
+        }
+        return _cmdManager;
     }
-    return _cmdManager;
 }
 
 - (WKReceiptManager *)receiptManager {
@@ -188,10 +215,13 @@ static WKSDK *_instance;
 
 
 -(WKCoder*) coder{
-    if(!_coder){
-        _coder =[WKCoder new];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if(!_coder){
+            _coder =[WKCoder new];
+        }
+        return _coder;
     }
-    return _coder;
 }
 
 -(BOOL) isDebug{

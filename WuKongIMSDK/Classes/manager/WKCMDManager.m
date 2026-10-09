@@ -172,17 +172,23 @@
 }
 
 - (NSLock *)delegateLock {
-    if (_delegateLock == nil) {
-        _delegateLock = [[NSLock alloc] init];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if (_delegateLock == nil) {
+            _delegateLock = [[NSLock alloc] init];
+        }
+        return _delegateLock;
     }
-    return _delegateLock;
 }
 
 -(NSHashTable*) delegates {
-    if (_delegates == nil) {
-        _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+    // 防并发首次初始化出多个实例（Round 12 普查，对应 Android 2585602）
+    @synchronized (self) {
+        if (_delegates == nil) {
+            _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+        }
+        return _delegates;
     }
-    return _delegates;
 }
 
 
