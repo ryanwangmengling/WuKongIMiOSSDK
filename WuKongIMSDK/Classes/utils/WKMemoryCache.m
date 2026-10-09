@@ -51,6 +51,13 @@
     [self.lock unlock];
     return value;
 }
+// 清空所有缓存
+-(void) removeAll {
+    [self.lock lock];
+    [self.cacheDictonary removeAllObjects];
+    [self.cacheArray removeAllObjects];
+    [self.lock unlock];
+}
 // 清理缓存（对外入口，自行加锁）
 -(void) cleanCache {
     [self.lock lock];

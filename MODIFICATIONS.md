@@ -344,5 +344,42 @@
 
 ---
 
+## Round 10 — 提醒项内存缓存 + 提醒管理器健壮性（2026-10-09）
+
+> 背景：Android `e91952f`「新增获取提醒项内存缓存」是为了修一个 ANR —— 堆栈是
+> `SQLiteConnectionPool` ← `ReminderDBManager.queryWithChannelAndDone()` ← `WKUIConversationMsg.getReminderList()` ← `ChatFragment.onRefresh()`，
+> 即在主线程直接查 SQLCipher。Android 的解法是在 `ReminderManager` 加一层按频道的提醒项内存缓存，并在退出登录时清空。iOS 的对应点是 `WKReminderManager`。
+
+### 10.1 新增提醒项内存缓存（对应 Android e91952f）
+- **文件**: `WuKongIMSDK/Classes/manager/WKReminderManager.h` / `.m`
+- **问题**: `getReminders:(WKReminderType)reminderType channel:` 每次都直接 `[[WKReminderDB shared] getWaitDoneReminders:channel type:]`。UI 层会在主线程频繁调用它（与 Android 同一路径），每次都是一次 SQLCipher 查询，是提醒列表卡顿 / ANR 的来源。
+- **改动**:
+  - 新增 `WKMemoryCache *reminderCache`（`maxCacheNum = 2000`，复用 Round 9 已加锁的 `WKMemoryCache`）。
+  - 缓存 key = `channelId_channelType_type`（提醒类型不同查询结果不同，必须分开存）。
+  - 命中直接返回；未命中查库后**存副本**再返回，避免调用方与缓存互相影响。
+  - 失效：`sync`（`addOrUpdates:` 之后）与 `done:`（`updateDone:` 之后）用本次变更的 `reminders` 逐条按 `(channel,type)` 精确失效 —— 不需要枚举所有类型，也就不会因为新增提醒类型而漏失效。
+  - 新增 `-(void) clearCache`；`WKConnectionManager.logout` 中调用，防止退出登录/切换账号后读到上个账号的提醒项。
+- **对应 Android**: `e91952f`（ReminderManager 内存缓存 + ConnectionManager.logout 里的 `clearAllCache`）。
+
+### 10.2 WKMemoryCache 新增 removeAll
+- **文件**: `WuKongIMSDK/Classes/utils/WKMemoryCache.h` / `.m`
+- Round 9 已让 `setCache:nil forKey:nil` 短路，因此不能用它清空缓存；新增加锁的 `-(void) removeAll`（同时清 `cacheDictonary` 与 `cacheArray`），供 `WKReminderManager.clearCache` 使用。
+
+### 10.3 提醒管理器健壮性
+- **文件**: `WuKongIMSDK/Classes/manager/WKReminderManager.m`
+- `delegateLock` / `delegates` / `reminderCache` 三个惰性 getter 加 `@synchronized(self)`：避免并发首次初始化各建一个对象导致互斥失效（延续 Round 8 / 9）。
+- `addDelegate:` / `removeDelegate:` 的参数类型原写成 `id<WKReactionManagerDelegate>`（从 `WKReactionManager` 复制粘贴留下的错误），改为头文件声明的 `id<WKReminderManagerDelegate>`。
+
+### 验证
+- `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r10 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`）。本轮未新增文件，无需 `pod install`。
+
+### 本轮甄别后判定「不移植」
+- `ce924cd`（优化同步最近会话）：核心是把逐条 `setOnRefreshMsg(msg, isEnd)` 改成批量 `setOnRefreshMsg(list)`。iOS `WKConversationManager` 早就是批量回调 `callOnConversationUpdateDelegates:(NSArray<WKConversation*>*)`，**N/A**；其中「同步会话每批 20→10」是 Android provider 侧参数，iOS 的批量大小由 App 提供的 `syncConversationProvider` 决定。
+- `8ec8e49`（ChannelMembersDbManager.queryCount cursor NPE）、`6a95caf`/`6d9d6ad`（getDb() 空指针）：ObjC 对 nil 发消息天然安全 —— iOS 用 `resultSet.next` / `[resultSet close]`，`resultSet == nil` 时不会崩；DB 生命周期防御已在 Round 3 / 4 覆盖。
+- `b1447cb`（logoutChat closeDbHelper 延迟 500ms）：iOS 的 DB 关闭竞态已在 Round 3（`switchDB` 关/开竞态、关闭后仍被调用）覆盖。
+
+---
+
 ## 待办（后续轮次）
-- Round 10 候选：`68d3e6f`/`d005ce6`（同步消息 DB 写入/OOM）、提醒项内存缓存（`e91952f`）、复核 `789faba`（附件消息 type）在 iOS 是否已等价、`ce924cd`（同步最近会话）。
+- Round 11 候选：`68d3e6f` 同步消息 DB 写入移后台线程（R8 判定风险大、暂缓，需先明确 `syncChannelMessageProvider` 回调线程语义）；`WKConversationManager` 委托 getter 并发初始化；复核 `6d9d6ad` 的 10 处 DB 事务在 iOS 是否都有防御。
+- 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

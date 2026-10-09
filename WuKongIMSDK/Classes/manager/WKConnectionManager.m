@@ -18,6 +18,7 @@
 #import "WKRecvPacket.h"
 #import "WKBackoff.h"
 #import "WKRetryManager.h"
+#import "WKReminderManager.h"
 #import "WKDB.h"
 #import "WKSDK.h"
 #import "WKDisconnectPacket.h"
@@ -410,6 +411,8 @@ static dispatch_queue_t _imsocketQueue;
     [self.connectStatusLock unlock];
     
     [[WKSDK shared].channelManager removeChannelAllCache];
+    // 退出登录时清空提醒项内存缓存，防止脏数据跨账号
+    [[WKReminderManager shared] clearCache];
     
     // 退出登录时取消排队中的退避重连
     [self cancelBackoffReconnect];

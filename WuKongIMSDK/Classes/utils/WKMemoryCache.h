@@ -34,6 +34,11 @@ NS_ASSUME_NONNULL_BEGIN
  */
 -(id) getCache:(NSString*)key;
 
+/**
+ 清空所有缓存
+ */
+-(void) removeAll;
+
 @end
 
 NS_ASSUME_NONNULL_END

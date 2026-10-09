@@ -37,6 +37,11 @@ typedef void(^WKReminderDoneProvider)(NSArray<NSNumber*> *ids,WKReminderDoneCall
 -(void) done:(NSArray<NSNumber*>*)ids;
 
 /**
+ 清空提醒项内存缓存（退出登录 / 切换账号时调用）
+ */
+-(void) clearCache;
+
+/**
  添加委托
  
  @param delegate <#delegate description#>

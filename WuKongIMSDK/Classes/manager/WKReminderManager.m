@@ -11,6 +11,7 @@
 #import "WKSDK.h"
 #import "WKRetryManager.h"
 #import "WKConversationManagerInner.h"
+#import "WKMemoryCache.h"
 @interface WKReminderManager ()
 
 /**
@@ -22,6 +23,14 @@
  *  delegateLock 用于给delegate的操作加锁，防止多线程同时调用
  */
 @property (strong, nonatomic) NSLock  *delegateLock;
+
+/**
+ *  提醒项内存缓存（key = channelId_channelType_type）
+ *  移植 Android e91952f：UI 层在主线程频繁调用 getReminders:channel:，
+ *  每次都会走一遍 SQLCipher 查询，是提醒列表卡顿 / ANR 的来源。
+ *  WKMemoryCache 已在 Round 9 加锁，这里直接复用。
+ */
+@property (strong, nonatomic) WKMemoryCache *reminderCache;
 
 @end
 
@@ -46,8 +55,54 @@ static WKReminderManager *_instance;
     return _instance;
 }
 
+- (WKMemoryCache *)reminderCache {
+    @synchronized (self) {
+        if(!_reminderCache) {
+            _reminderCache = [[WKMemoryCache alloc] init];
+            _reminderCache.maxCacheNum = 2000;
+        }
+    }
+    return _reminderCache;
+}
+
+// 缓存 key：频道 + 提醒类型（类型不同查询结果不同，必须分开存）
+-(NSString*) cacheKeyForChannel:(WKChannel*)channel type:(WKReminderType)type {
+    return [NSString stringWithFormat:@"%@_%d_%lu",channel.channelId,channel.channelType,(unsigned long)type];
+}
+
+// 提醒项发生变化后按 (频道,类型) 精确失效，避免下一次读到旧数据
+-(void) invalidateCacheForReminders:(NSArray<WKReminder*>*)reminders {
+    if(!reminders || reminders.count == 0) {
+        return;
+    }
+    for (WKReminder *reminder in reminders) {
+        if(!reminder.channel) {
+            continue;
+        }
+        [self.reminderCache setCache:nil forKey:[self cacheKeyForChannel:reminder.channel type:reminder.type]];
+    }
+}
+
+// 清空提醒项内存缓存（退出登录 / 切换账号时必须调用，防止脏数据跨账号）
+-(void) clearCache {
+    [self.reminderCache removeAll];
+}
+
 -(NSArray<WKReminder*>*) getReminders:(WKReminderType)reminderType channel:(WKChannel*)channel {
-    return  [[WKReminderDB shared] getWaitDoneReminders:channel type:reminderType];
+    if(!channel) {
+        return @[];
+    }
+    NSString *key = [self cacheKeyForChannel:channel type:reminderType];
+    NSArray<WKReminder*> *cached = [self.reminderCache getCache:key];
+    if(cached) { // 命中缓存
+        return cached;
+    }
+    NSArray<WKReminder*> *reminders = [[WKReminderDB shared] getWaitDoneReminders:channel type:reminderType];
+    if(reminders) {
+        // 存副本，避免调用方（或缓存内部淘汰）与返回值互相影响
+        [self.reminderCache setCache:[reminders copy] forKey:key];
+    }
+    return reminders;
 }
 
 -(void) sync {
@@ -69,6 +124,7 @@ static WKReminderManager *_instance;
             [sets addObject:reminder.channel];
         }
         [[WKReminderDB shared] addOrUpdates:reminders];
+        [weakSelf invalidateCacheForReminders:reminders];
         [weakSelf updateConversations:sets];
         
     });
@@ -89,6 +145,7 @@ static WKReminderManager *_instance;
     }
     
     [[WKReminderDB shared] updateDone:ids];
+    [self invalidateCacheForReminders:reminders];
     NSMutableSet *sets = [[NSMutableSet alloc] init];
     for (WKReminder *reminder in reminders) {
         [sets addObject:reminder.channel];
@@ -133,27 +190,31 @@ static WKReminderManager *_instance;
 
 
 - (NSLock *)delegateLock {
-    if (_delegateLock == nil) {
-        _delegateLock = [[NSLock alloc] init];
+    @synchronized (self) {
+        if (_delegateLock == nil) {
+            _delegateLock = [[NSLock alloc] init];
+        }
     }
     return _delegateLock;
 }
 
 -(NSHashTable*) delegates {
-    if (_delegates == nil) {
-        _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+    @synchronized (self) {
+        if (_delegates == nil) {
+            _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+        }
     }
     return _delegates;
 }
 
 
 
--(void) addDelegate:(id<WKReactionManagerDelegate>) delegate{
+-(void) addDelegate:(id<WKReminderManagerDelegate>) delegate{
     [self.delegateLock lock];//防止多线程同时调用
     [self.delegates addObject:delegate];
     [self.delegateLock unlock];
 }
-- (void)removeDelegate:(id<WKReactionManagerDelegate>) delegate {
+- (void)removeDelegate:(id<WKReminderManagerDelegate>) delegate {
     [self.delegateLock lock];//防止多线程同时调用
     [self.delegates removeObject:delegate];
     [self.delegateLock unlock];
