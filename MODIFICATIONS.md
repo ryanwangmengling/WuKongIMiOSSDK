@@ -151,6 +151,57 @@
 
 ---
 
+## Round 5 — 图片 OOM 与 formatter 缓存（2026-10-09）
+
+> 背景：对应 Android 的图片 OOM 修复 `9c7878d`/`151e946`（「改进图片尺寸获取方式防止OOM，使用 BitmapFactory.Options 替代直接解码」）、`16c6ca8`（同批次稳定性优化），以及 `16f46f9`（`DateUtils.time2DateStr` 改 `ThreadLocal<SimpleDateFormat>` 修 Bugly#35089/#35070 OOM）。
+> iOS 侧对应的问题是：**整图解码**（`[UIImage imageWithData:]` / `imageWithContentsOfFile:`），以及在**原图全分辨率**上反复做 JPEG 压缩；另有每条消息反序列化都 new 一个 `NSDateFormatter`。
+
+### 5.1 新增 WKImageUtil（ImageIO 内存友好图片工具，新文件）
+- **文件**: `WuKongIMSDK/Classes/utils/WKImageUtil.h` / `.m`（新增）
+- **问题**: Android 有 `BitmapFactory.Options.inJustDecodeBounds`（只读尺寸）和 `inSampleSize`（解码阶段采样），iOS SDK 里没有等价封装，导致各处只能整图解码。
+- **改动**: 新增 `WKImageUtil`，用 ImageIO 提供：
+  - `imageSizeWithData:` / `imageSizeWithFile:`：`CGImageSourceCopyPropertiesAtIndex` 只读像素尺寸，**不解码**（等价 `inJustDecodeBounds`，并处理 EXIF 方向 >= 5 的宽高互换）。
+  - `downsampleImageWithData:maxPixelSize:` / `downsampleImageWithFile:...`：`CGImageSourceCreateThumbnailAtIndex` + `kCGImageSourceThumbnailMaxPixelSize`，解码阶段只产生目标尺寸位图（等价 `inSampleSize`）。
+  - `downsampleImage:maxPixelSize:`：对已在内存的 UIImage 用 `UIGraphicsBeginImageContextWithOptions(..., 1.0)` 降采样。
+  - `compressImage:toMaxBytes:` / `compressImageData:toMaxBytes:`：先降采样再质量二分压缩到 `options.imageMaxBytes`。
+- **对应 Android**: `9c7878d` / `151e946`（`BitmapFactory.Options` 替代直接解码）。
+
+### 5.2 缩略图生成不再整图解码 + 全分辨率反复压缩（OOM 主因）
+- **文件**: `WuKongIMSDK/Classes/model/content/WKImageContent.m`（`writeDataToLocalPath`、原 `compressImageSize:toByte:`）
+- **问题**: 原 `compressImageSize:toByte:` 先在**原图全分辨率**上 `UIImageJPEGRepresentation`，再最多 6 次二分压缩，仍不满足时用 `UIGraphicsBeginImageContext` 在全尺寸上缩放——大图（相机原图）会同时存在多张全尺寸位图/压缩缓冲，是 iOS 端图片 OOM 的主要来源。data 分支更是直接 `[UIImage imageWithData:self.data]` 整图解码。
+- **改动**: 压缩逻辑收敛到 `WKImageUtil`：
+  - `orgImage` 分支 → `[WKImageUtil compressImage:self.orgImage toMaxBytes:...]`，进入二分前先按 `defaultMaxPixelSize`（1600px）降采样。
+  - `data` 分支 → `[WKImageUtil compressImageData:...]`，用 ImageIO 采样解码，**全程不产生全分辨率位图**。
+  - 保留原有「质量 1 已满足大小则直接返回」的快路径与小图行为。
+- **对应 Android**: `9c7878d` / `151e946`。
+
+### 5.3 thumbnailImage 降采样解码
+- **文件**: `WuKongIMSDK/Classes/model/content/WKImageContent.m`（`thumbnailImage`）
+- **问题**: 原实现 `[UIImage imageWithContentsOfFile:[self thumbPath]]` 按缩略图文件的原始分辨率整图解码，文件异常偏大时顶高内存峰值。
+- **改动**: 改为 `[WKImageUtil downsampleImageWithFile:... maxPixelSize:defaultMaxPixelSize]`；ImageIO 解不了时退回原逻辑，保证可用性。
+- **对应 Android**: `9c7878d` / `151e946`。
+
+### 5.4 图片尺寸读取不解码
+- **文件**: `WuKongIMSDK/Classes/model/content/WKImageContent.m`（`writeDataToLocalPath` 的 data 分支）
+- **问题**: 调用方用 `initWithData:width:height:` 但宽高传 0 时，过去没有兜底，SDK 不会补尺寸（等于要调用方自己解码）。
+- **改动**: 当 `width<=0 || height<=0` 时用 `[WKImageUtil imageSizeWithData:self.data]` 只读尺寸补全，不解码整图。
+- **对应 Android**: `151e946`（`inJustDecodeBounds` 只获取图片信息，不加载到内存）。
+
+### 5.5 NSDateFormatter 每行 new → 每线程缓存
+- **文件**: `WuKongIMSDK/Classes/db/WKMessageDB.m`（`dateFromString:`）
+- **问题**: 历史消息/群成员分页反序列化时每行都执行 `dateFromString:`，原实现每次都 `[[NSDateFormatter alloc] init]`（每个约 2~3KB），100 行就是约 100 个瞬时分配，堆压力明显（对应 Bugly#35089/#35070）。
+- **改动**: 新增 `+ wk_dateFormatter`，用 `NSThread.currentThread.threadDictionary` 做每线程缓存（等价 Android 的 `ThreadLocal<SimpleDateFormat>`；`NSDateFormatter` 非线程安全，不能简单的 static 共享），分配次数从 O(行数) 降到 O(线程数)；空字符串直接返回 nil。
+- **对应 Android**: `16f46f9`。
+
+### 验证
+- Example 目录 `pod install`（新文件 `WKImageUtil.h/.m` 需进 Pods 工程）后
+  `xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r5 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`）。
+
+### 已知未处理（后续可评估）
+- `WKImageContent.writeDataToLocalPath` 的 `orgImage` 分支仍用 `UIImagePNGRepresentation` 把原图写成 **PNG**（无损、体积与编码内存峰值都大）；改成 JPEG 或直接沿用调用方文件会改变上传内容格式，属行为变更，本轮未动。
+- `originalImage` 仍是整图解码，这是「原图」的 API 语义；建议 App 侧预览/列表改用 `WKImageUtil downsampleImageWithFile:maxPixelSize:`。
+
+---
+
 ## 待办（后续轮次）
-- Round 5: OOM（图片尺寸读取/解码降采样 `CGImageSourceCreateThumbnailAtIndex` + `kCGImageSourceThumbnailMaxPixelSize`，对应 Android `16c6ca8`/`9c7878d`/`151e946`；时间格式化 formatter 缓存，对应 Android `16f46f9` DateUtils 改 ThreadLocal）。
 - Round 6: 功能补齐（typing/输入中、频道状态、群成员同步、提醒缓存、信令）。

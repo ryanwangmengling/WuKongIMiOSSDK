@@ -10,6 +10,7 @@
 #import "WKMediaUtil.h"
 #import "WKFileUtil.h"
 #import "WKSDK.h"
+#import "WKImageUtil.h"
 #import "WKMOSContentConvertManager.h"
 @interface WKImageContent ()
 @property(nonatomic,strong) UIImage  *orgImage;
@@ -61,7 +62,15 @@
 
 -(UIImage*) thumbnailImage {
     if(!_thumbnailImage) {
-        _thumbnailImage = [UIImage imageWithContentsOfFile:[self thumbPath]];
+        // 修复(OOM)：原实现 [UIImage imageWithContentsOfFile:] 按文件里的原始分辨率整图解码，
+        // 缩略图文件异常偏大时会顶高内存峰值。改为按最大边长降采样解码
+        // （对应 Android BitmapFactory.Options.inSampleSize 采样解码）。
+        _thumbnailImage = [WKImageUtil downsampleImageWithFile:[self thumbPath]
+                                                  maxPixelSize:[WKImageUtil defaultMaxPixelSize]];
+        if(!_thumbnailImage) {
+            // 极少数格式（ImageIO 解不了）退回原逻辑，保证可用性
+            _thumbnailImage = [UIImage imageWithContentsOfFile:[self thumbPath]];
+        }
     }
     return _thumbnailImage;
 }
@@ -81,8 +90,10 @@
        self.width = self.orgImage.size.width;
        self.height = self.orgImage.size.height;
        
-        NSData *thumdData = [self compressImageSize:self.orgImage toByte:[WKSDK shared].options.imageMaxBytes];
-                                      [thumdData writeToFile:self.thumbPath atomically:YES];
+        NSData *thumdData = [WKImageUtil compressImage:self.orgImage toMaxBytes:[WKSDK shared].options.imageMaxBytes];
+       if(thumdData) {
+           [thumdData writeToFile:self.thumbPath atomically:YES];
+       }
        
        [UIImagePNGRepresentation(self.orgImage) writeToFile:self.localPath atomically:YES];
     }
@@ -90,63 +101,26 @@
         if(self.thumbData) {
              [self.thumbData writeToFile:self.thumbPath atomically:YES];
         }else {
-            NSData *thumbData = [self compressImageSize:[UIImage imageWithData:self.data] toByte:[WKSDK shared].options.imageMaxBytes];
-            [thumbData writeToFile:self.thumbPath atomically:YES];
+            // 修复(OOM)：原实现 [UIImage imageWithData:self.data] 会按原分辨率整图解码，
+            // 相机原图（几十 MB 位图）在发送时会直接顶爆内存。
+            // 改为 ImageIO 采样解码 + 质量压缩，峰值内存由 WKImageUtil.defaultMaxPixelSize 决定
+            // （对应 Android BitmapFactory.Options.inSampleSize 的图片 OOM 修复 9c7878d/151e946）。
+            NSData *thumbData = [WKImageUtil compressImageData:self.data toMaxBytes:[WKSDK shared].options.imageMaxBytes];
+            if(thumbData) {
+                [thumbData writeToFile:self.thumbPath atomically:YES];
+            }
+        }
+        // 调用方没有给出尺寸时，只读取像素尺寸（不解码整图，对应 Android inJustDecodeBounds）
+        if(self.width <= 0 || self.height <= 0) {
+            CGSize size = [WKImageUtil imageSizeWithData:self.data];
+            if(size.width > 0 && size.height > 0) {
+                self.width = size.width;
+                self.height = size.height;
+            }
         }
        
         [self.data writeToFile:self.localPath atomically:YES];
     }
-}
-
-/*!
- *  @brief 使图片压缩后刚好小于指定大小
- *
- *  @param image 当前要压缩的图 maxLength 压缩后的大小
- *
- *  @return 图片对象
- */
-//图片质量压缩到某一范围内，如果后面用到多，可以抽成分类或者工具类,这里压缩递减比二分的运行时间长，二分可以限制下限。
-- (NSData *)compressImageSize:(UIImage *)image toByte:(NSUInteger)maxLength{
-    //首先判断原图大小是否在要求内，如果满足要求则不进行压缩，over
-    CGFloat compression = 1;
-    NSData *data = UIImageJPEGRepresentation(image, compression);
-    if (data.length < maxLength) return data;
-    //原图大小超过范围，先进行“压处理”，这里 压缩比 采用二分法进行处理，6次二分后的最小压缩比是0.015625，已经够小了
-    CGFloat max = 1;
-    CGFloat min = 0;
-    for (int i = 0; i < 6; ++i) {
-        compression = (max + min) / 2;
-        data = UIImageJPEGRepresentation(image, compression);
-        if (data.length < maxLength * 0.9) {
-            min = compression;
-        } else if (data.length > maxLength) {
-            max = compression;
-        } else {
-            break;
-        }
-    }
-    //判断“压处理”的结果是否符合要求，符合要求就over
-    UIImage *resultImage = [UIImage imageWithData:data];
-    if (data.length < maxLength) return data;
-    
-    //缩处理，直接用大小的比例作为缩处理的比例进行处理，因为有取整处理，所以一般是需要两次处理
-    NSUInteger lastDataLength = 0;
-    while (data.length > maxLength && data.length != lastDataLength) {
-        lastDataLength = data.length;
-        //获取处理后的尺寸
-        CGFloat ratio = (CGFloat)maxLength / data.length;
-        CGSize size = CGSizeMake((NSUInteger)(resultImage.size.width * sqrtf(ratio)),
-                                 (NSUInteger)(resultImage.size.height * sqrtf(ratio)));
-        //通过图片上下文进行处理图片
-        UIGraphicsBeginImageContext(size);
-        [resultImage drawInRect:CGRectMake(0, 0, size.width, size.height)];
-        resultImage = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        //获取处理后图片的大小
-        data = UIImageJPEGRepresentation(resultImage, compression);
-    }
-    
-    return data;
 }
 
 - (void)decodeWithJSON:(NSDictionary *)contentDic {

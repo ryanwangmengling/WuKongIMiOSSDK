@@ -1148,11 +1148,30 @@ static WKMessageDB *_instance;
     return message;
 }
 - (NSDate *)dateFromString:(NSString *)str {
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
-    [formatter setTimeZone:[NSTimeZone timeZoneWithName:@"Asia/Shanghai"]];
-    NSDate *date = [formatter dateFromString:str];
-    return date;
+    if(str.length == 0) {
+        return nil;
+    }
+    NSDateFormatter *formatter = [WKMessageDB wk_dateFormatter];
+    return [formatter dateFromString:str];
+}
+
+// 修复(OOM，对应 Android 16f46f9「perf: Bugly#35089/#35070 OOM — DateUtils.time2DateStr 改 ThreadLocal 缓存」)：
+// 历史消息/群成员分页反序列化时，每一行消息都会执行一次 dateFromString:，
+// 原实现每次都 new 一个 NSDateFormatter（每个实例约 2~3KB），
+// 100 行就是约 100 个瞬时分配，堆压力明显。
+// NSDateFormatter 非线程安全，这里用 NSThread.threadDictionary 做每线程缓存
+// （等价 Android 的 ThreadLocal<SimpleDateFormat>），分配次数从 O(行数) 降到 O(线程数)。
++ (NSDateFormatter *)wk_dateFormatter {
+    static NSString *const kFormatterKey = @"wk_message_db_date_formatter";
+    NSMutableDictionary *threadDictionary = [[NSThread currentThread] threadDictionary];
+    NSDateFormatter *formatter = threadDictionary[kFormatterKey];
+    if(!formatter) {
+        formatter = [[NSDateFormatter alloc] init];
+        [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
+        [formatter setTimeZone:[NSTimeZone timeZoneWithName:@"Asia/Shanghai"]];
+        threadDictionary[kFormatterKey] = formatter;
+    }
+    return formatter;
 }
 
 
