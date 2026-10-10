@@ -945,10 +945,35 @@ for (NSInteger i=0; i<channelIDs.count; i++) {
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r28 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**。本轮未新增文件，无需 `pod install`。
 
 ---
+
+## Round 29 — 移植 Android 握手 DH/AES 空值防护，修复非法 serverKey 导致 Curve25519 抛异常崩溃（2026-10-11）
+
+### 29.1 背景
+- 候选排除：`WKReminderDB.m` 全文复核（254 行）无新增问题（Round 27 已修 `getWaitDoneReminders:`；`addOrUpdates:` :56-67 在事务内逐条 executeUpdate 忽略失败，低风险）；`substringToIndex:` 全 Classes 仅 2 处，均在 `WKSecurityManager.m`。
+- Android 全量对照：HEAD `662a559` 前 60 条中有实质内容者均已在本文档记录；未记录仅 `9978523`(Add logs)/`22b28ce`(merge)/`deb45d9`(merge)/`7c8624a`(优化导入版本)，无移植价值。
+- **崩溃链（本轮主修复）**：连接握手 `WKConnectionManager.handleConnected:`（:1004-1006）→ `WKSecurityManager.generateAesKey:connackPacket.serverKey salt:connackPacket.salt`（:47-61）。`serverKey` 来自 `WKConnackPacket.decodeLM:`（:37 `packet.serverKey=[reader readString]`），`WKData readString`（:185-202）在长度为 0/越界时返回 `@""`、在非 UTF-8 字节时返回 nil，且协议层无任何长度校验。`initWithBase64EncodedString:options:IgnoreUnknownCharacters` 对空串/非法串返回**空 data（length 0，非 nil）**，随后 `Curve25519 generateSharedSecretFromPublicKey:andKeyPair:` 因 `[theirPublicKey length] != 32` **`@throw NSInvalidArgumentException`（`Example/Pods/25519/Classes/Curve25519.m:89-94`，Pod 依赖，非 fork 代码）**，未捕获 → 握手阶段直接崩溃。
+- 经验验证（`clang -fobjc-arc` 小程序）：非法 base64 → 空 data length 0；`initWithData:nil` → 非 nil 空串；`[nil length]`=0；`writeVariableString:nil` 写 0 长度（安全）；`strlen(NULL)` → **段错误 exit 139**。
+
+### 29.2 改动（2 个文件）
+对应 Android 提交 `b006969 "update connect"`（`git log -S "TextUtils.isEmpty(serverKey)"` / `-S "key.length() > 16"` 均命中），其 `CryptoUtils.setServerKeyAndSalt`（`wkim/src/main/java/com/xinbida/wukongim/utils/CryptoUtils.java:72-88`）已有：空 `serverKey`/`salt` 早退（`this.serverKey=new byte[0]; return;`）与 `if(!TextUtils.isEmpty(key) && key.length()>16) aesKey=key.substring(0,16)`；iOS 对应实现缺失。
+1. `WuKongIMSDK/Classes/manager/WKSecurityManager.m` `generateAesKey:salt:`（:47-85）：入口校验 `self.curve25519Key` 非空且 base64 解码后 `pubKeyData.length == 32`（`pubKey?:@""` 兜底）；`sharedKeyData` 为 nil、`aesKeyFull` 为 nil 或长度 < 16 时均打 warn 并 `self.sharedKey/aesKey/aesIV = nil` 后 return，不再把非法公钥交给 Curve25519、不再对短串 `substringToIndex:16` 越界。
+2. `WuKongIMSDK/Classes/manager/WKSecurityManager.h` `sharedKey` 声明加 `nullable`（协商失败即为 nil，与实现一致）。
+3. `WuKongIMSDK/Classes/manager/WKSecurityManager.m` `md5:`（:88-92）：入口加 `if(!input || input.length==0) return nil;`，防 `strlen(NULL)` 段错误。两个调用方对 nil 均安全：`WKRecvPacket.m:61-64` 走 `![nil isEqualToString:]`→YES→判「消息不合法」返回 nil；`WKSendPacket.m:62` `writeVariableString:nil` 写 0 长度。
+
+### 29.3 判定 / 附带结论
+- 降级行为：协商失败后 `aesKey/aesIV` 为 nil，`WKAESUtil` 对 nil key 走 bzero 全零 key（不崩），收包解密失败由 Round 28 的 `WKRecvPacket.m` 兜底退化为空负载 → 连接不再因非法 serverKey 崩溃。
+- 不改 Curve25519（Pod 依赖）：在不修改第三方 Pod 的前提下，按 Android 同构做法在调用前做长度校验即可完全避免该 `@throw`。
+- `salt` 长度守卫 iOS 原本已有（`salt.length>16`），仅补齐空值/短 key 部分。
+
+### 29.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r29 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，`WKSecurityManager.m` 无 `-Wnonnull` 警告（`sharedKey` 改 nullable 后消除），日志 `/tmp/wk_build_r29b.log`。本轮未新增文件，无需 `pod install`。
+
+---
 ## 待办（后续轮次）
-- Round 29 候选（按优先级）：
+- Round 30 候选（按优先级）：
   1. `WKConnectionManager` 其余未受 `isDebug` 保护的低频/异常日志（`Classes/manager/WKConnectionManager.m` :596/:615/:818/:1037）是否统一收敛。
   2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径的失败处理）。
   3. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
   4. `WKReminderDB` 其余写路径（`addOrUpdates:` `insertOrUpdateReminders:` 等）的失败处理与批量写走查。
+  5. 复核 `WKAESUtil` 在 nil key/iv 时用全零 key 静默降级，是否应改为显式拒绝发送（待评估）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

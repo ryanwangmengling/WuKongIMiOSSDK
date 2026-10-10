@@ -13,7 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (WKSecurityManager *)shared;
 
-@property(nonatomic,copy) NSString *sharedKey; // 共享key
+@property(nonatomic,copy,nullable) NSString *sharedKey; // 共享key（协商失败/未协商时为 nil）
 
 
 /**
