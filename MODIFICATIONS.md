@@ -683,8 +683,37 @@ iOS 的对应机制与 Android 不同：iOS 没有 `contain` 参数，而是由 
 
 ---
 
+## Round 19 — 频道请求队列生命周期 + 回应回调契约修复（iOS 自有缺陷）（2026-10-09）
+
+### 19.1 背景
+`WKChannelManager.addChannelRequest:complete:`（`manager/WKChannelManager.m:118` → `WKChannelRequestQueue` 的 `addRequest:complete:`）面向「大量 cell 请求同一频道数据」的场景：同一频道的并发请求应共享一次 provider 调用，且每一个调用方都要拿到结果；请求结束后应能再次发起。对照同一文件里另一条路径 `WKChannelManager fetchChannelInfo:completion:`（:72-112）——它在锁内把重复请求 append 到 `blockArray`（:87）、最终回调前 `removeObjectForKey:key`（:103）——`WKChannelRequestQueue` 的实现与之语义不一致，导致该 API 事实上第二次起失效。Android 无此类 `ChannelRequestQueue`，本轮记为「iOS 自有缺陷」，无对应 Android commit。
+
+### 19.2 改动
+
+**`manager/WKChannelRequestQueue.m`**（4 类问题）
+
+1. **请求完成后从不移出队列（核心）**。原 `createRequest:`（:105-126）的 provider 回调在最终结果（`notifyBefore==NO`）时只置 `request.status = Success/Error` 并回调 complete，**不移除** `requests`/`requestDict`。后果：某频道首次请求完成后该请求永久驻留，之后同频道 `addRequest:` 一律命中「已存在」分支（原 :78-83），既不再调用 provider，也不回调新的 complete → `addChannelRequest:complete:` 从第二次起永久失效（直到被 10 个其它频道的请求挤出）。改为最终回调前在锁内校验 `requestDict[key] == request` 后移除 `requests`/`requestDict` 并置 status。
+2. **重复请求时后到者的 complete 被丢弃**。原 `createRequest:` 只捕获第一个 complete；命中已存在请求时只把 request 移到队首，`complete` 参数完全未使用——而该 API 的设计意图正是「大量 cell 获取同一频道数据」，每个 cell 都应收到回调。改为 `WKChannelRequest` 新增 `NSMutableArray<WKChannelRequestComplete> *completes` 收集同频道全部回调：`notifyBefore==YES`（缓存/中间结果）时回调当前全部挂起 block 且不移除请求；最终结果时在锁内快照并清空 completes、锁外逐块回调。
+3. **在锁内执行 App 代码**。原实现是在持有 `self.lock`（NSRecursiveLock）时调用 App 提供的 `[WKSDK shared].channelInfoUpdate(...)`，provider 若同步回调即在锁内跑用户代码，重入安全只靠递归锁侥幸。改为「先在锁内登记请求 → 解锁 → 再调用 provider」；所有 complete 回调（含取消/淘汰路径）统一在锁外执行。
+4. **取消 / 容量淘汰不回调挂起方**。`cancelRequest:`（:128）与超过 `channelRequestMaxLimit`（默认 10，`WKOptions.m:46`）的淘汰路径原来只 `[request cancel]`，从不回调 complete，调用方永久等待。两处都补 `complete([NSError errorWithDomain:@"频道信息请求已被取消" / @"频道请求过多，已被取消" code:0 userInfo:nil], NO)`；并补 `channel` 为空时早退并回调错误，避免 provider 收到 nil 频道、调用方挂起。
+5. 附带：原淘汰逻辑会把「已完成但未移除」的请求也计入并发上限；修复 1 之后 `channelRequestMaxLimit` 恢复为「进行中请求」上限的语义。原 `createRequest:` 先调 provider 再设 `request.channel`，provider 同步回调时 `request.channel` 尚为 nil，本轮一并调整为先组装再发起。
+
+**`manager/WKReactionManager.m`**（1 处）
+
+6. **`addOrCancelReaction:messageID:complete:` 提前 return 不回调 complete**（原 :46 / :51）。未设置 `addOrCancelReactionProvider`、或 `getMessageWithMessageId:` 返回 nil（R16 之后「消息已删除」也走此分支）时直接 return，调用方会永久等待。两处补 `complete([NSError ...])`，domain 分别为「没有设置addOrCancelReactionProvider」「消息不存在或已删除，不能回应」。
+
+### 19.3 判定「不移植 / 无对应 / 已有覆盖」
+- 本轮为 iOS 自有缺陷，Android 无对应提交。
+- 顺带复查 R16 的「已删除消息查询过滤」是否有回归：`getMessageWithMessageId:` 的全部调用点（`WKMessageDB.m:650`/`:662`/`:204`、`WKRetryManager.m:275`/`:417`、`WKChatManager.m:361`/`:378`、`WKReactionManager.m:50`）在 nil 分支的处理均可接受（跳过刷新/通知），无有害回归。
+
+### 19.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r19 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r19.log`）。本轮未新增文件，无需 `pod install`。
+
+---
+
 ## 待办（后续轮次）
-- Round 19 候选：`WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
+- Round 20 候选：`WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
 - `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
 - `WKRetryManager` 重发链路在「已删除消息」上的行为复查（R16 后 `getMessageWithMessageId:` 对已删除消息返回 nil，需确认 :251/:393 的 nil 分支不会误判为「消息不存在」而丢弃重试）。
+- 全库其余「提前 return 不回调 complete」的 API 契约普查（本轮已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

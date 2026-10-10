@@ -45,11 +45,19 @@ static WKReactionManager *_instance;
 -(void) addOrCancelReaction:(NSString*)reactionName messageID:(uint64_t)messageID complete:(void(^)(NSError *error))complete{
     if(!self.addOrCancelReactionProvider) {
         NSLog(@"没有设置addOrCancelReactionProvider，忽略添加或取消回应！");
+        if(complete) {
+            // 必须回调，否则调用方会永久等待（Round 19）
+            complete([NSError errorWithDomain:@"没有设置addOrCancelReactionProvider" code:0 userInfo:nil]);
+        }
         return;
     }
     WKMessage *message =  [[WKMessageDB shared] getMessageWithMessageId:messageID];
     if(!message) {
         NSLog(@"没有查询到消息！,不能回应");
+        if(complete) {
+            // 必须回调，否则调用方会永久等待（Round 19）
+            complete([NSError errorWithDomain:@"消息不存在或已删除，不能回应" code:0 userInfo:nil]);
+        }
         return;
     }
     self.addOrCancelReactionProvider(message.channel, messageID,reactionName, ^(NSError *error){
