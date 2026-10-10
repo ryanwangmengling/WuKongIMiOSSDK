@@ -629,7 +629,9 @@ static dispatch_queue_t _imsocketQueue;
 }
 
 - (void)socket:(GCDAsyncSocket *)sock didReadPartialDataOfLength:(NSUInteger)partialLength tag:(long)tag {
-    NSLog(@"didReadPartialDataOfLength--->%lu",(unsigned long)partialLength);
+    if([WKSDK shared].isDebug) {
+        NSLog(@"didReadPartialDataOfLength--->%lu",(unsigned long)partialLength);
+    }
 }
 
 
@@ -641,7 +643,9 @@ static dispatch_queue_t _imsocketQueue;
      }
     // 解包
     [self unpacket:data callback:^(NSArray<NSData *> *data) {
-        NSLog(@"------------解包消息数量--------> %lu",(unsigned long)data.count);
+        if([WKSDK shared].isDebug) {
+            NSLog(@"------------解包消息数量--------> %lu",(unsigned long)data.count);
+        }
         [self handlePacketData:data];
     }];
     
@@ -802,7 +806,9 @@ static dispatch_queue_t _imsocketQueue;
             }];
             lenAfter = self.tempBufferData.length;
             if(lenAfter>0) {
-                NSLog(@"有剩余未被解析的包->%lu",lenAfter);
+                if([WKSDK shared].isDebug) {
+                    NSLog(@"有剩余未被解析的包->%lu",lenAfter);
+                }
             }
         } while (lenBefore != lenAfter && lenAfter >= 1);
         if (dataList.count > 0) {
@@ -853,18 +859,24 @@ static dispatch_queue_t _imsocketQueue;
     } while (hasLength);
     
     if (!remLengthFull) {
-        NSLog(@"包长度没有读出来");
+        if([WKSDK shared].isDebug) {
+            NSLog(@"包长度没有读出来");
+        }
         return packData;
     }
     int remLengthLength = pos - fixedHeaderLength; // 剩余长度的长度
     if (fixedHeaderLength + remLengthLength + remLength > length) {
         // 固定头的长度 + 剩余长度的长度 + 剩余长度 如果大于 总长度说明分包了
-        NSLog(@"分包了...剩余长度：%d  当前长度：%lu",remLength,(unsigned long)length);
+        if([WKSDK shared].isDebug) {
+            NSLog(@"分包了...剩余长度：%d  当前长度：%lu",remLength,(unsigned long)length);
+        }
         return packData;
     }else {
         if (fixedHeaderLength + remLengthLength + remLength == length) {
             // 刚好一个包
-            NSLog(@"刚好一个包");
+            if([WKSDK shared].isDebug) {
+                NSLog(@"刚好一个包");
+            }
             callback(packData);
             return [[NSMutableData alloc] init];
         } else {
@@ -876,7 +888,9 @@ static dispatch_queue_t _imsocketQueue;
             callback(fullPackData);
             NSData *remPackData = [packData subdataWithRange:NSMakeRange(packetLength, length-packetLength)];
             
-            NSLog(@"粘包  大于1个包，包长度:%i-%lu-%lu-%lu",packetLength,fullPackData.length,remPackData.length,length);
+            if([WKSDK shared].isDebug) {
+                NSLog(@"粘包  大于1个包，包长度:%i-%lu-%lu-%lu",packetLength,fullPackData.length,remPackData.length,length);
+            }
             
             return [[NSMutableData alloc] initWithData:remPackData];
         }
@@ -890,14 +904,20 @@ static dispatch_queue_t _imsocketQueue;
     }
     self.lastMsgTimeInterval = [[NSDate date] timeIntervalSince1970];
     NSMutableArray<WKPacket*> *packets = [NSMutableArray array];
-    NSLog(@"包数量--->%lu",dataList.count);
+    if([WKSDK shared].isDebug) {
+        NSLog(@"包数量--->%lu",dataList.count);
+    }
     for (NSData *data in dataList) {
        WKPacket *packet =  [[WKSDK shared].coder decode:data];
         if(!packet) {
-            NSLog(@"未解码到数据！->%@",data);
+            if([WKSDK shared].isDebug) {
+                NSLog(@"未解码到数据！->%@",data);
+            }
             continue;
         }
-         NSLog(@"解码到包 -> %@",packet);
+        if([WKSDK shared].isDebug) {
+            NSLog(@"解码到包 -> %@",packet);
+        }
         if([packet header].packetType == WK_CONNACK) {
             WKConnackPacket *connackPacket = (WKConnackPacket*)packet;
             self.reasonCodeInner = connackPacket.reasonCode;
@@ -942,7 +962,9 @@ static dispatch_queue_t _imsocketQueue;
     // 取出临时包，按「临时包在前，当前包在后」的顺序处理
     NSArray<WKPacket*> *pendingPackets = [self drainTempPackets];
     if(pendingPackets.count>0) {
-        NSLog(@"有临时包,数量:%lu",(unsigned long)pendingPackets.count);
+        if([WKSDK shared].isDebug) {
+            NSLog(@"有临时包,数量:%lu",(unsigned long)pendingPackets.count);
+        }
         NSMutableArray<WKPacket*> *allPackets = [NSMutableArray arrayWithCapacity:pendingPackets.count+packets.count];
         [allPackets addObjectsFromArray:pendingPackets];
         [allPackets addObjectsFromArray:packets];
@@ -966,7 +988,9 @@ static dispatch_queue_t _imsocketQueue;
             case  WK_PONG:
                 break;
             default:
-                NSLog(@"未知的数据包-->[%d]",packetTypeNum.unsignedIntValue);
+                if([WKSDK shared].isDebug) {
+                    NSLog(@"未知的数据包-->[%d]",packetTypeNum.unsignedIntValue);
+                }
                 break;
         }
     }

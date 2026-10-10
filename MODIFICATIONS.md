@@ -837,12 +837,36 @@ Android 无对应 commit：Android 侧无 `updateChannelSetting`/`ChannelSetting
 ### 24.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r24 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r24.log`）。本轮未新增文件，无需 `pod install`。
 
+## Round 25 — 收包热路径日志收敛 + 媒体委托机制修复（iOS 自有加固）（2026-10-09）
+
+### 25.1 背景
+- `manager/WKConnectionManager.m` 共 39 处 `NSLog`，其中收包/分包/解包热路径上仍有多条未受 `[WKSDK shared].isDebug` 保护：`socket:didReadPartialDataOfLength:`（:632）、`didReadData:` 的解包数量（:644）、`unpacket:` 每轮循环（:805）、`unpackOneLM:` 的分包/整包/粘包分支（:856/:862/:867/:879）、`handlePacketData:` 的包数量/解码失败/解码成功（:893/:897/:900，其中 :897 会打印整段原始 `data`）、临时包数量（:945）、`handlePackets:` 未知包类型（:969）。这些日志在每次 TCP 读取、每个消息包上都会执行，iOS 的 `NSLog` 会同步写 stderr/`os_log`，消息量大时会明显拖慢收包线程并放大 IO 开销（Android 侧 4151c42「logger ANR」的同类思路）。
+- `manager/WKMediaManager.m`：`addDelegate:`/`removeDelegate:` 直接访问 `self.delegates`，但类扩展只声明了 `NSHashTable *delegates` 属性、**没有对应的惰性 getter**（同类 manager 如 `WKReactionManager.m:106-114` 均有），因此 `_delegates` 恒为 nil，委托注册/注销实际是空操作；协议方法 `mediaManageUpdate:` 全库也无任何调用点。
+- `coder/WKCoder.m` `encodeLM:`（:32）写作 `if(packetType == WK_PING)`，而 `packetType` 已是 `header.packetType<<4`、`WK_PING=7`，该比较恒为 false、是死代码（`decodeLM:` 用的是 `flag>>4`）。
+
+### 25.2 改动
+1. `manager/WKConnectionManager.m`：把上述 11 处热路径 `NSLog`（:632/:644/:805/:856/:862/:867/:879/:893/:897/:900/:945/:969）收敛到 `if([WKSDK shared].isDebug)` 内；`socketDidDisconnect`（:615）、解包异常（:812）等低频/错误日志保持无条件输出。行为逻辑不变，仅日志输出条件变化。
+2. `manager/WKMediaManager.m`：
+   - 类扩展新增 `-(void)callMediaManageUpdateDelegate:(id<WKMediaProto>)media;` 前置声明；
+   - 新增 `-(NSHashTable*) delegates` 惰性 getter（`@synchronized(self)` + `NSPointerFunctionsWeakMemory`），使 `addDelegate:`/`removeDelegate:` 真正生效；
+   - 新增 `callMediaManageUpdateDelegate:`，加锁取 delegates 快照后在主线程回调（与 `WKReactionManager.callReactionManagerChangeDelegate:` 同构）；
+   - `taskComplete:`（:175-194）在上传任务成功/失败处理后，若 `message.content` 符合 `WKMediaProto` 则调用 `callMediaManageUpdateDelegate:`（语义：媒体数据已更新，如上传成功后 remoteUrl 被赋值）；
+   - `taskProgress:`（:166-173）的上传/下载进度 `NSLog` 同样收敛到 `isDebug`（进度回调可能非常频繁）。
+3. `coder/WKCoder.m` `encodeLM:`：`if(packetType == WK_PING)` 改为 `if(packet.header.packetType == WK_PING)`。因 PING/PONG 的 body `encode:` 均返回 nil、`encodeLength:0` 返回空数据，两种写法产生的字节完全相同（仅 1 字节固定头，`appendData:nil` 为 no-op），**不改变线上协议行为**，仅消除死代码隐患。
+
+### 25.3 判定不移植 / 附带结论
+- Android 无与热路径日志逐条对应的 commit；本轮按 4151c42「logger ANR」的意图在 iOS 侧独立收敛，记为 iOS 自有加固。
+- `WKMediaManager` 委托机制修复为 iOS 自有（Android 无 `mediaManageUpdate:` 同构协议）。
+- 附带确认 `encodeLength:0` 不产生缺长度前缀的坏包：`-[NSMutableData appendData:nil]` 实测为 no-op（编译运行 `/tmp/t_append.m` 验证）。
+
+### 25.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r25 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r25.log`）。本轮未新增文件，无需 `pod install`。
+
 ---
 ## 待办（后续轮次）
-- Round 25 候选（按优先级）：
-  1. `WKMediaManager` 的 `delegates`（NSHashTable）从未赋值、`addDelegate:`/`removeDelegate:` 为 no-op，且协议方法 `mediaManageUpdate:` 全库无任何调用点（R22/R24 勘察发现，属死代码；确认无调用方后清理或补全 getter + 触发点）。
-  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
-  3. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查。
-  4. `WKDataWrite.encodeLength:`（`coder/WKCoder.m:67-78`）对 `length==0` 返回空数据（缺少长度前缀），核查是否存在零长度 body 的包会踩中。
-  5. `WKConnectionManager.handlePacketData:` 内多条未受 `isDebug` 保护的 `NSLog`（:893/:897/:900 等）在热路径上，评估收敛为 `isDebug` 保护。
+- Round 26 候选（按优先级）：
+  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB.saveMessages:` :199-256 循环内 `getMessageWithMessageIdOrClientMsgNo:clientMsgNo:db:` 的 N+1 存在性查询，`replaceMessages:` :258-294 在 `dupMessage==nil` 时静默吞掉插入失败）。
+  2. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查。
+  3. `WKRobotDB.m:52/71` 用双引号包字符串拼 `IN (...)` 的 DQS 风险（R20 遗留）。
+  4. `WKConnectionManager` 其余未受 `isDebug` 保护的低频日志（:596/:615/:812/:1013/:1072）是否统一收敛。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

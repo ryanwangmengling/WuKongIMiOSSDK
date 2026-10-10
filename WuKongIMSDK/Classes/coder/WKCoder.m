@@ -29,7 +29,10 @@
     uint8_t flag = packet.header.syncOnce << 2 | packet.header.showUnread << 1 |   packet.header.noPersist;
     uint8_t fixHeader = (packetType | flag);
     [bufferData appendBytes:&fixHeader length:1];
-    if(packetType == WK_PING) {
+    // 原来误与 WK_PING 枚举值直接比较（packetType 已是 flag<<4），该分支恒不成立、为死代码。
+    // 现与 decodeLM: 一致比较 packet.header.packetType。
+    // PING/PONG 的 body encode: 均返回 nil，两种写法产生的字节完全相同（仅 1 字节固定头），不改变协议行为。
+    if(packet.header.packetType == WK_PING) {
         return  bufferData;
     }
     // 编码body

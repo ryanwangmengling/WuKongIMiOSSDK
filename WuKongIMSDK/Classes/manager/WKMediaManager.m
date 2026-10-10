@@ -32,6 +32,9 @@
  */
 @property (strong, nonatomic) NSLock  *delegateLock;
 
+// 通知已注册的媒体委托：媒体数据已更新
+- (void)callMediaManageUpdateDelegate:(id<WKMediaProto>)media;
+
 // ------ 音频播放 ------
 @property(nonatomic,strong) AVAudioPlayer *avAudioPlayer;   //播放器player
 @property(nonatomic,copy) WKAudioPlayerDidFinishBlock  playerDidFinishBlock;
@@ -164,6 +167,9 @@ static WKMediaManager *_instance;
 #pragma mark - WKTaskManagerDelegate
 
 -(void) taskProgress:(id<WKTaskProto>)task {
+    if(![WKSDK shared].isDebug) {
+        return;
+    }
     if([task isKindOfClass:[WKMessageFileUploadTask class]]) {
         NSLog(@"上传进度->%0.2f",((WKMessageFileUploadTask*)task).progress);
     }else  if([task isKindOfClass:[WKMessageFileDownloadTask class]]) {
@@ -190,6 +196,10 @@ static WKMediaManager *_instance;
         [[WKMessageDB shared] updateMessageStatus:message.status withClientSeq:message.clientSeq];
         // 通知上层消息更新
         [[WKSDK shared].chatManager callMessageUpdateDelegate:message];
+    }
+    // 通知媒体委托：媒体数据已更新（如上传成功后 App 的 task provider 为 media 赋上 remoteUrl）
+    if([[message content] conformsToProtocol:@protocol(WKMediaProto)]) {
+        [self callMediaManageUpdateDelegate:(id<WKMediaProto>)[message content]];
     }
 }
 
@@ -347,6 +357,40 @@ static WKMediaManager *_instance;
             _delegateLock = [[NSLock alloc] init];
         }
         return _delegateLock;
+    }
+}
+
+-(NSHashTable*) delegates {
+    // 惰性初始化：此前 addDelegate:/removeDelegate: 直接访问 self.delegates 而不经过此 getter，
+    // 导致 _delegates 恒为 nil、委托注册实际是空操作（Round 25 修复）
+    @synchronized (self) {
+        if (_delegates == nil) {
+            _delegates = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory];
+        }
+        return _delegates;
+    }
+}
+
+-(void) callMediaManageUpdateDelegate:(id<WKMediaProto>)media {
+    if(!media) {
+        return;
+    }
+    [self.delegateLock lock];
+    NSHashTable *copyDelegates = [self.delegates copy];
+    [self.delegateLock unlock];
+    for (id<WKMediaManagerDelegate> delegate in copyDelegates) {
+        if(!delegate) {
+            continue;
+        }
+        if([delegate respondsToSelector:@selector(mediaManageUpdate:)]) {
+            if(![NSThread isMainThread]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [delegate mediaManageUpdate:media];
+                });
+            } else {
+                [delegate mediaManageUpdate:media];
+            }
+        }
     }
 }
 
