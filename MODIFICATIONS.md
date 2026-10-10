@@ -1151,13 +1151,61 @@ C. 让根因可观测：
 ### 35.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r35 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r35.log`。
 
+## Round 36 — 最近会话落库失败不再谎报成功（单条 insert/update 返回真实结果 + 失败不通知 UI）（2026-10-12）
+
+### 36.1 背景
+- 承接 R32/R33/R34 的「失败不得谎报成功」主线，本轮补上**最近会话（conversation）单条写**这一段。
+- `WKConversationManager.addOrUpdateConversation:incUnreadCount:`（`manager/WKConversationManager.m`:38-74）在会话不存在时调 `insertConversation:db:`、已存在时调 `updateConversation:db:`，但两者均为 `void` 且**丢弃 `executeUpdate` 返回值**：
+  ```objc
+  -(void) insertConversation:(WKConversation*)conversation db:(FMDatabase*)db{
+      ...
+      [db executeUpdate:SQL_INSERT, ...];   // 失败（如 channel_id+channel_type 已存在）无人知晓
+  }
+  ```
+- `WKConversationAddOrUpdateResult`（`db/WKConversationDB.h`:203-212）只带 `insert`/`modify`，**没有成功位**；上游 `WKChatManager.addOrUpdateConversationWithMessage:unreadCount:`（:737-751）拿 `result.conversation` 后无条件返回，`addOrUpdateConversationWithMessages:`（:719-733）并无条件 `[conversations addObject:]` + `callOnConversationUpdateDelegates:` —— 即 DB 写失败时 UI 仍收到一条**并未落库的会话**，重进 App 后消失。
+
+### 36.2 Android 对照（本轮为**忠实移植**）
+- `ConversationDbManager.insertOrUpdateWithConvMsg`（`wkim/src/main/java/com/xinbida/wukongim/db/ConversationDbManager.java`:361-375）：
+  ```java
+  boolean result;
+  if (lastMsg == null || TextUtils.isEmpty(lastMsg.channelID)) result = insert(conversationMsg);
+  else { conversationMsg.unreadCount = lastMsg.unreadCount + conversationMsg.unreadCount; result = update(conversationMsg); }
+  if (result) { return getUIMsg(conversationMsg); }
+  return null;                        // 写失败返回 null
+  ```
+- `insert`（:377-391）返回 `result > 0`（rowId）；`update`（:399-411）返回 `SQLiteDatabase.update` 的 **affectedRows>0**。
+- 调用方 `MessageHandler.java`:555-558 明确 `if (conversationMsg != null) refreshList.add(...)` —— **null 不进刷新列表**。即 Android 原本就「写失败不通知 UI」，iOS 缺失该语义，本轮补齐。
+
+### 36.3 改动（4 个文件 / 12 处）
+一、`db/WKConversationDB.h`
+- `insertConversation:db:` 返回类型 `void` → `BOOL`；`updateConversation:db:` 同理（注明「命中至少一行」）。
+- `WKConversationAddOrUpdateResult` 新增 `@property(nonatomic,assign) BOOL success;`（默认 YES）。
+二、`db/WKConversationDB.m`
+- `insertConversation:db:`（现 :122-132）：捕获 `executeUpdate` 结果，失败打 `WARN: 最近会话插入失败 channelId:%@ channelType:%d error:%@` 并返回 NO（对齐 Android `insert` 的 rowId>0）。
+- `updateConversation:db:`（现 :238-247）：`success = executeUpdate && [db changes] > 0`（对齐 Android `update` 的 affectedRows>0；FMDB 的 `executeUpdate` 在 0 行命中时仍返回 YES，必须用 `db.changes` 兜底），失败打 WARN 返回 NO。
+- `initWithInsert:modify:conversation:`（现 :467-473）补 `result.success = YES;`。
+三、`manager/WKConversationManager.m`
+- `addOrUpdateConversation:incUnreadCount:`（现 :38-81）：新增 `__block BOOL success = YES;`，update/insert 分支接住返回值，失败置 `success = NO`，末尾 `result.success = success`。
+四、`manager/WKChatManager.m`
+- `addOrUpdateConversationWithMessage:unreadCount:`（现 :737-751）：`!result.success` 时打 `WARN: 最近会话落库失败，跳过会话更新通知 ...` 并 `return nil`（不再取提醒项、不再通知）。
+- `addOrUpdateConversationWithMessages:`（现 :719-735）：`if(conversation)` 才 `addObject:`（避免 nil 崩溃，且只通知真正落库的会话；直接对应 `MessageHandler.java`:556 的 null 判断）。
+
+### 36.4 判定
+- 未改 `WKConversationDB.updateConversation:(WKConversation*)conversation`（无 db 参数重载，现 :249）与 `addConversation:`（现 :118）等内部 void 便捷方法：它们只是「取队列 + 调本方法」，调用方本就 fire-and-forget；下层新加的 WARN 已可观测。
+- 未改 `WKConversationDB.m:82/84 addOrUpdateConversation:`（DB 层便捷方法，同样 fire-and-forget）：保持最小侵入。
+- `result.modify` 语义（「添加或更新都为 true」）保持不变；成功位单独用 `success` 表达，避免影响既有调用方对 `modify` 的任何假设。
+- 未改 `WKConversationAddOrUpdateResult` 构造函数签名，仅在构造后设置 `success`（并在 init 内默认 YES），对外零破坏。
+
+### 36.5 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r36 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r36.log`。
+
 ---
 ## 待办（后续轮次）
-- Round 36 候选（按优先级）：
+- Round 37 候选（按优先级）：
   1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage:...` 忽略 `WKMessageDB` 落库结果；`WKMessageDB` 其余 void update：`updateMessageStatus:withClientSeq:`、`deleteMessagesWithClientSeqs:`、`destoryMessage:` 等失败处理）。
-  2. `WKConversationManager.addOrUpdateConversation:incUnreadCount:` 返回的 `WKConversationAddOrUpdateResult` 被 `WKChatManager.addOrUpdateConversationWithMessages:`（:719-733）完全忽略，单条会话写失败仍通知 UI。
-  3. `WKConversationDB.insertConversation:db:`/`updateConversation:db:`、`WKChannelMemberDB.deleteMembers:`、`WKConversationExtraDB.updateVersion:` 等单条写仍忽略 `executeUpdate` 失败，评估是否统一上报。
+  2. `WKChannelMemberDB.deleteMembers:`、`WKConversationExtraDB.updateVersion:` 等单条写仍忽略 `executeUpdate` 失败，评估统一上报。
+  3. `WKConversationDB.addConversation:`/`updateConversation:`（无 db 重载）是否也需向上返回结果。
   4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
   5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
-  6. Android 未移植提交继续扫描——本轮已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽（PR #24 索引已 R3 移植；PR #25/#26 是 Android 关闭 DB 竞态，iOS 无 DB 关闭路径；9d07754 是 rawQuery→select，iOS 已用占位符绑定）。
+  6. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

@@ -119,11 +119,16 @@ static WKConversationDB *_instance;
     }];
 }
 
--(void) insertConversation:(WKConversation*)conversation db:(FMDatabase*)db{
+// 返回 YES 表示写入成功。失败（如 channel_id+channel_type 已存在）返回 NO 并打 WARN（Round 36，对齐 Android ConversationDbManager.insert 的 result>0）
+-(BOOL) insertConversation:(WKConversation*)conversation db:(FMDatabase*)db{
     NSString *extraStr = [self extraToStr:conversation.extra];
     NSString *parentChannelID  = conversation.parentChannel?conversation.parentChannel.channelId:@"";
     uint8_t parentChannelType = conversation.parentChannel?conversation.parentChannel.channelType:0;
-    [db executeUpdate:SQL_INSERT,conversation.channel.channelId?:@"",@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
+    BOOL success = [db executeUpdate:SQL_INSERT,conversation.channel.channelId?:@"",@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
+    if(!success) {
+        NSLog(@"WARN: 最近会话插入失败 channelId:%@ channelType:%d error:%@",conversation.channel.channelId?:@"",conversation.channel.channelType,db.lastErrorMessage);
+    }
+    return success;
 }
 
 -(void) clearConversationUnreadCount:(WKChannel*)channel {
@@ -229,8 +234,16 @@ static WKConversationDB *_instance;
     }
 }
 
--(void) updateConversation:(WKConversation*)conversation db:(FMDatabase*)db{
-    [db executeUpdate:SQL_UPDATE_LASTMSG,conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),conversation.channel.channelId,@(conversation.channel.channelType)];
+// 返回 YES 表示更新成功且命中至少一行（对齐 Android ConversationDbManager.update 的 affectedRows>0）。失败返回 NO 并打 WARN（Round 36）
+-(BOOL) updateConversation:(WKConversation*)conversation db:(FMDatabase*)db{
+    BOOL success = [db executeUpdate:SQL_UPDATE_LASTMSG,conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),conversation.channel.channelId,@(conversation.channel.channelType)];
+    if(success && [db changes] <= 0) {
+        success = NO;
+    }
+    if(!success) {
+        NSLog(@"WARN: 最近会话更新失败 channelId:%@ channelType:%d error:%@",conversation.channel.channelId?:@"",conversation.channel.channelType,db.lastErrorMessage);
+    }
+    return success;
 }
 
 -(void) updateConversation:(WKConversation*)conversation{
@@ -456,6 +469,7 @@ static WKConversationDB *_instance;
     result.insert = insert;
     result.conversation = conversation;
     result.modify = modify;
+    result.success = YES; // 默认成功；调用方落库失败时置 NO（Round 36）
     return result;
 }
 

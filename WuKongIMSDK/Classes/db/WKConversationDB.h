@@ -101,7 +101,8 @@ NS_ASSUME_NONNULL_BEGIN
  @param conversation <#conversation description#>
  @param db <#db description#>
  */
--(void) updateConversation:(WKConversation*)conversation db:(FMDatabase*)db;
+/// @return YES 更新成功且命中至少一行；失败返回 NO 并打 WARN（Round 36）
+-(BOOL) updateConversation:(WKConversation*)conversation db:(FMDatabase*)db;
 
 
 /**
@@ -110,7 +111,8 @@ NS_ASSUME_NONNULL_BEGIN
  @param conversation <#conversation description#>
  @param db <#db description#>
  */
--(void) insertConversation:(WKConversation*)conversation db:(FMDatabase*)db;
+/// @return YES 写入成功；失败返回 NO 并打 WARN（Round 36）
+-(BOOL) insertConversation:(WKConversation*)conversation db:(FMDatabase*)db;
 
 
 /**
@@ -203,6 +205,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic,assign) BOOL insert;
 
 @property(nonatomic,assign) BOOL modify; // 数据是否修改（添加或更新都为true）
+
+/// 落库是否成功。DB 写失败时为 NO（默认 YES），调用方据此决定是否通知 UI（Round 36）
+@property(nonatomic,assign) BOOL success;
 
 @property(nonatomic,strong) WKConversation *conversation;
 

@@ -38,6 +38,7 @@
 -(WKConversationAddOrUpdateResult*) addOrUpdateConversation:(WKConversation*)cs incUnreadCount:(NSInteger)unUnreadCount{
     __block BOOL isInsert = false;
     __block BOOL modify = false;
+    __block BOOL success = YES;
     __block WKConversation *blockConversation;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
         WKConversation *conversation =  [[WKConversationDB shared] getConversationWithChannelInAll:cs.channel db:db];
@@ -58,19 +59,25 @@
                 modify = true;
             }
             if(modify) {
-                [[WKConversationDB shared] updateConversation:conversation db:db];
+                if(![[WKConversationDB shared] updateConversation:conversation db:db]) {
+                    success = NO; // 落库失败，调用方不得通知 UI（Round 36）
+                }
             }
             blockConversation = conversation;
             isInsert = false;
         }else {
             cs.unreadCount = unUnreadCount;
-            [[WKConversationDB shared] insertConversation:cs db:db];
+            if(![[WKConversationDB shared] insertConversation:cs db:db]) {
+                success = NO; // 落库失败，调用方不得通知 UI（Round 36）
+            }
              blockConversation = cs;
             isInsert = true;
             modify = true;
         }
     }];
-    return [WKConversationAddOrUpdateResult initWithInsert:isInsert modify:modify conversation:blockConversation];
+    WKConversationAddOrUpdateResult *result = [WKConversationAddOrUpdateResult initWithInsert:isInsert modify:modify conversation:blockConversation];
+    result.success = success;
+    return result;
 }
 
 -(BOOL) needUpdate:(WKConversation*)newConversation old:(WKConversation*)oldConversation {

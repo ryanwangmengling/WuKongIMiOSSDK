@@ -723,7 +723,9 @@
         NSMutableArray *conversations = [NSMutableArray array];
         for (WKConversationLastMessageAndUnreadCount *lastMessageUnreadModel in chatMessageUnreadModels) {
             WKConversation *conversation =  [self addOrUpdateConversationWithMessage:lastMessageUnreadModel.lastMessage unreadCount:lastMessageUnreadModel.incUnreadCount];
-            [conversations addObject:conversation];
+            if(conversation) { // 落库失败的会话返回 nil，不得加入通知列表（Round 36）
+                [conversations addObject:conversation];
+            }
             
         }
         if(conversations.count>0) {
@@ -738,6 +740,11 @@
     
     //    [conversation.reminderManager mergeReminders:reminders];
     WKConversationAddOrUpdateResult *result = [[[WKSDK shared] conversationManager] addOrUpdateConversation:conversation incUnreadCount:unreadCount];
+    if(!result.success) {
+        // 最近会话落库失败，不能向 UI 谎报成功（Round 36，对齐 Android insertOrUpdateWithConvMsg 失败返回 null）
+        NSLog(@"WARN: 最近会话落库失败，跳过会话更新通知 channelId:%@ channelType:%d",result.conversation.channel.channelId?:@"",result.conversation.channel.channelType);
+        return nil;
+    }
     NSArray<WKReminder*> *reminders = [[WKReminderDB shared] getWaitDoneReminder:conversation.channel];
     result.conversation.reminders = reminders;
     return result.conversation;
