@@ -31,12 +31,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 添加最近会话信息
 /// @param conversation <#conversation description#>
--(void) addConversation:(WKConversation*)conversation;
+-(BOOL) addConversation:(WKConversation*)conversation; // Round 38: 返回是否写入成功
 
 
 /// 恢复指定会话
 /// @param channel <#channel description#>
-/// @return 如果存在会话的会话则返回，不存在则返回nil
+/// @return 恢复成功（存在且 is_deleted=0 落库成功）时返回该会话；不存在或恢复写库失败返回 nil（Round 38）
 -(WKConversation*) recoveryConversation:(WKChannel*)channel;
 
 /**
@@ -120,22 +120,22 @@ NS_ASSUME_NONNULL_BEGIN
 
  @param channel <#channel description#>
  */
--(void) clearConversationUnreadCount:(WKChannel*)channel;
+-(BOOL) clearConversationUnreadCount:(WKChannel*)channel; // Round 38: 返回是否命中并写库成功
 
 
 
 /// 设置最近会话未读数
 /// @param channel 频道
 /// @param unread 未读数量
--(void) setConversationUnreadCount:(WKChannel*)channel unread:(NSInteger)unread;
+-(BOOL) setConversationUnreadCount:(WKChannel*)channel unread:(NSInteger)unread; // Round 38
 
 
 /// 删除指定频道的最近会话
 /// @param channel 频道对象
--(void) deleteConversation:(WKChannel*)channel;
+-(BOOL) deleteConversation:(WKChannel*)channel; // Round 38
 
 /// 删除所有最近会话
--(void) deleteAllConversation;
+-(BOOL) deleteAllConversation; // Round 38
 /**
  更新最近会话的标题和头像
 
@@ -144,7 +144,7 @@ NS_ASSUME_NONNULL_BEGIN
  @param avatar <#avatar description#>
  @param db <#db description#>
  */
--(void) updateConversation:(WKChannel*)channel title:(NSString*)title avatar:(NSString*) avatar db:(FMDatabase*)db;
+-(BOOL) updateConversation:(WKChannel*)channel title:(NSString*)title avatar:(NSString*) avatar db:(FMDatabase*)db; // Round 38
 
 
 //
@@ -195,7 +195,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// 更新频道预览的位置
 /// @param browseTo <#browseTo description#>
 /// @param channel <#channel description#>
--(void) updateBrowseTo:(uint32_t)browseTo forChannel:(WKChannel*)channel;
+-(BOOL) updateBrowseTo:(uint32_t)browseTo forChannel:(WKChannel*)channel; // Round 38
 
 @end
 

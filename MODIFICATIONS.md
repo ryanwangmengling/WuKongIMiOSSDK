@@ -1241,13 +1241,48 @@ C. 让根因可观测：
 - 全量 grep 确认 2 个文件中所有 `Round 37` 标记与预期一致（`WKMessageDB.m` 11 处 WARN + `destoryMessage:` BOOL 化 + `WKChatManager.m` 1 处守卫）。
 
 ---
+## Round 38 — 最近会话「删除/未读/恢复」落库失败不再谎报成功（2026-10-13）
+
+### 38.1 背景
+- 承接 R32–R37 的「失败不得谎报成功 / 失败必须可观测」主线：R36 已让「新增/更新最近会话」的单条写返回真实结果并据此决定是否通知 UI，本轮补齐同一对象的**删除 / 清空未读 / 设置未读 / 恢复**。
+- 改动前 iOS 行为：`WKConversationManager` 的 `deleteConversation:`、`clearConversationUnreadCount:`、`setConversationUnreadCount:` 先调 DB 写（`-(void)`、丢弃 `executeUpdate`），再**无条件**通知 UI（`callOnConversationDeleteDelegate:` / `callOnConversationUnreadCountUpdateDelegate:`）；`recoveryConversation:` 在恢复 update 失败时仍返回会话并通知 delete 委托。
+- 后果：DB 写失败时 UI 仍把会话从列表移除 / 未读数显示为 0 → 内存与磁盘状态不一致，重启后会话「复活」。
+
+### 38.2 Android 对照
+- **直接对标**：`ConversationDbManager.deleteWithChannel`（`ConversationDbManager.java`:321-339）返回 boolean，**仅当 result 为 true 才** `ConversationManager.getInstance().setDeleteMsg(...)`（:334-336）；`ConversationManager.deleteWitchChannel`（:130-132）返回该 boolean，`clearAll()`（:137-139）返回 `ConversationDbManager.clearEmpty()` 的 boolean。即 Android 是「先落库、成功再回调/删内存」。
+- **无对标**：清空未读 / 设置未读 / recovery —— Android 无对应方法（未读并入 `ConversationManager.java:121 updateMsg`），本轮为 iOS 自身一致性修复。
+
+### 38.3 改动（3 个文件）
+一、`db/WKConversationDB.h`
+- 7 处签名 `-(void)` → `-(BOOL)`：`addConversation:`（:34）、`clearConversationUnreadCount:`（:123）、`setConversationUnreadCount:unread:`（:130）、`deleteConversation:`（:135）、`deleteAllConversation`（:138）、`updateConversation:title:avatar:db:`（:147）、`updateBrowseTo:forChannel:`（:198）；`recoveryConversation:`（:39-40）注释补充「恢复写库失败返回 nil」。
+二、`db/WKConversationDB.m`
+- `addConversation:`（:116-125）返回 `insertConversation:db:` 的结果（后者 R36 已 BOOL+WARN）。
+- `clearConversationUnreadCount:`（:137-147）、`setConversationUnreadCount:unread:`（:149-160）：`success = [db executeUpdate:...] && [db changes] > 0`（与 R36 `updateConversation:db:` 的「命中至少一行」语义一致），失败打 `WARN: 清空/设置最近会话未读数失败`。
+- `deleteConversation:`（:161-172）：同上（`SQL_DELETE_CONVERSATION` 实为 `update conversation set is_deleted=1`），失败打 `WARN: 删除最近会话失败`。
+- `deleteAllConversation`（:173-183）：只看 `executeUpdate`（`delete from conversation` 无行可比对，不要求 changes>0），失败打 WARN。
+- `updateBrowseTo:forChannel:`（:246-256）、`updateConversation:title:avatar:db:`（:288-296）：`executeUpdate && changes>0` + WARN（iOS 内暂无调用者，属 API 一致性补齐）。
+- `recoveryConversation:`（:358-375）：新增 `__block BOOL recovered = NO;`，`recovered = [db executeUpdate:SQL_RECOVERY_CONVERSATION,...] && [db changes] > 0`，失败打 `WARN: 恢复最近会话失败`，末尾 `return recovered ? conversation : nil;`。
+三、`manager/WKConversationManager.m`
+- `clearConversationUnreadCount:`（:152-160）、`setConversationUnreadCount:unread:`（:162-171）、`deleteConversation:`（:173-182）：接住 `WKConversationDB` 的 BOOL，**仅成功才**调用 `callOnConversationUnreadCountUpdateDelegate:` / `callOnConversationDeleteDelegate:`；失败打 `WARN: ...落库失败，跳过 UI 通知`。
+- `recoveryConversation:`（:99-104）无需改：DB 失败已返回 nil，原逻辑即按 nil 跳过 `callOnConversationDeleteDelegate:`。
+
+### 38.4 判定
+- manager 方法签名仍保持 `void`（不扩张公开 API）；「不上报」通过**抑制 UI 通知 + WARN**实现，与 R36 `addOrUpdateConversation:` 的做法一致。
+- `WKConversationManager.addConversation:`（:95-97）保持纯转发：它不通知 UI，DB 层 `insertConversation:db:` 已 WARN，不存在「谎报」；DB 层已返回结果供上层需要时调用。
+- 采用 `changes>0`（命中至少一行）判定：SQLite `changes` 对 UPDATE 统计的是**匹配行数**（赋相同值也算命中），故「未读数已是 0 再清 0」「已 is_deleted=1 再删」仍视为成功；仅「行不存在 / SQL 报错」判为失败并抑制通知。`deleteAllConversation` 为例外（DELETE 无行可比对）。
+- 未改 `WKChatManager.m:443 [[WKConversationDB shared] deleteAllConversation];` 调用点：DB 已 WARN，且「清空全部会话」是显式用户操作，无需额外抑制。
+- **R38 原候选「区分 `saveMessages:` 空结果原因」判定为无需改**：勘察确认 `WKChatManager.saveMessages:`（:221-234）先 `message.isDeleted = ![self needStoreOfIntercept:message]`（:226），而 `WKMessageDB.saveMessages:`（:199-260）对 `is_deleted=1` 的消息**同样插入并加入 newMessages**（:236-239），空结果只来自去重命中同 seq（:205-214 continue）或写库失败（:250-253 R26 已 WARN）。故「拦截器判定不存」不会产生空结果，改返回值无意义。
+
+### 38.5 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r38 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r38.log`。本轮未新增文件，无需 `pod install`。
+
+---
 ## 待办（后续轮次）
-- Round 38 候选（按优先级）：
-  1. `WKChatManager.saveMessage:`/`WKMessageDB.saveMessages:` 返回空结果的**原因可区分**：区分「入库拦截器判定不存」（合法）与「写库失败」，前者保持发送、后者打 WARN（甚至返回未落库标记）。不能在未区分前改返回 nil。
-  2. `WKChannelMemberDB.deleteMembers:`（现 :161-165）、`WKConversationExtraDB.updateVersion:`（现 :38-42）等单条写仍忽略 `executeUpdate` 失败，评估统一上报（本轮未动）。
-  3. `WKConversationDB.addConversation:`/`updateConversation:`（无 db 重载）是否也需向上返回结果。
-  4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
-  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
-  6. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
-  7. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口（详见本轮勘察记录）。
+- Round 39 候选（按优先级）：
+  1. 继续「单条写失败可观测」扫尾：`WKChannelMemberDB.deleteMembers:`、`WKConversationExtraDB.updateVersion:`、以及 `WKChannelInfoDB`/`WKReminderDB`/`WKPinnedMessageDB`/`WKCMDDB`/`WKRobotDB`/`WKMessageExtraDB`/`WKDB.m` 等约 30 处语句式 `executeUpdate` 仍丢弃返回值（可批量加 WARN，注意避免刷屏）。
+  2. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。
+  3. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
+  4. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
+  5. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
+  6. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

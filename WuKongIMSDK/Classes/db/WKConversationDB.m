@@ -113,10 +113,13 @@ static WKConversationDB *_instance;
     return success;
 }
 
--(void) addConversation:(WKConversation*)conversation {
+// 返回 YES 表示写入成功；insertConversation:db: 内部已负责失败 WARN（Round 38 向上返回结果，供调用方决定是否通知 UI）
+-(BOOL) addConversation:(WKConversation*)conversation {
+    __block BOOL success = NO;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [self insertConversation:conversation db:db];
+        success = [self insertConversation:conversation db:db];
     }];
+    return success;
 }
 
 // 返回 YES 表示写入成功。失败（如 channel_id+channel_type 已存在）返回 NO 并打 WARN（Round 36，对齐 Android ConversationDbManager.insert 的 result>0）
@@ -131,28 +134,52 @@ static WKConversationDB *_instance;
     return success;
 }
 
--(void) clearConversationUnreadCount:(WKChannel*)channel {
+// Round 38: 返回 YES 表示命中会话并写库成功（changes>0），失败打 WARN。调用方据此决定是否通知 UI
+-(BOOL) clearConversationUnreadCount:(WKChannel*)channel {
+    __block BOOL success = NO;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_CLEAR_UNREADCOUNT,channel.channelId,@(channel.channelType)];
+        success = [db executeUpdate:SQL_CLEAR_UNREADCOUNT,channel.channelId?:@"",@(channel.channelType)] && [db changes] > 0;
+        if(!success) {
+            NSLog(@"WARN: 清空最近会话未读数失败 channelId:%@ channelType:%d error:%@",channel.channelId?:@"",channel.channelType,db.lastErrorMessage);
+        }
     }];
+    return success;
 }
 
--(void) setConversationUnreadCount:(WKChannel*)channel unread:(NSInteger)unread {
+// Round 38: 同 clearConversationUnreadCount:
+-(BOOL) setConversationUnreadCount:(WKChannel*)channel unread:(NSInteger)unread {
+    __block BOOL success = NO;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_SET_UNREADCOUNT,@(unread),channel.channelId,@(channel.channelType)];
+        success = [db executeUpdate:SQL_SET_UNREADCOUNT,@(unread),channel.channelId?:@"",@(channel.channelType)] && [db changes] > 0;
+        if(!success) {
+            NSLog(@"WARN: 设置最近会话未读数失败 channelId:%@ channelType:%d unread:%ld error:%@",channel.channelId?:@"",channel.channelType,(long)unread,db.lastErrorMessage);
+        }
     }];
+    return success;
 }
 
--(void) deleteConversation:(WKChannel*)channel {
+// Round 38: 返回 YES 表示命中会话并置 is_deleted=1（changes>0），失败打 WARN
+-(BOOL) deleteConversation:(WKChannel*)channel {
+    __block BOOL success = NO;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_DELETE_CONVERSATION,channel.channelId?:@"",@(channel.channelType)];
+        success = [db executeUpdate:SQL_DELETE_CONVERSATION,channel.channelId?:@"",@(channel.channelType)] && [db changes] > 0;
+        if(!success) {
+            NSLog(@"WARN: 删除最近会话失败 channelId:%@ channelType:%d error:%@",channel.channelId?:@"",channel.channelType,db.lastErrorMessage);
+        }
     }];
+    return success;
 }
 
--(void) deleteAllConversation {
+// Round 38: 返回 YES 表示 delete 语句执行成功（无行可比对，不要求 changes>0）
+-(BOOL) deleteAllConversation {
+    __block BOOL success = NO;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_DELETE_ALL_CONVERSATION];
+        success = [db executeUpdate:SQL_DELETE_ALL_CONVERSATION];
+        if(!success) {
+            NSLog(@"WARN: 删除全部最近会话失败 error:%@",db.lastErrorMessage);
+        }
     }];
+    return success;
 }
 
 
@@ -216,10 +243,16 @@ static WKConversationDB *_instance;
     return unreadCount;
 }
 
--(void) updateBrowseTo:(uint32_t)browseTo forChannel:(WKChannel*)channel {
+// Round 38: 返回 YES 表示命中会话并写库成功
+-(BOOL) updateBrowseTo:(uint32_t)browseTo forChannel:(WKChannel*)channel {
+    __block BOOL success = NO;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_UPDATE_BROWSETO,@(browseTo),channel.channelId,@(channel.channelType)];
+        success = [db executeUpdate:SQL_UPDATE_BROWSETO,@(browseTo),channel.channelId?:@"",@(channel.channelType)] && [db changes] > 0;
+        if(!success) {
+            NSLog(@"WARN: 更新最近会话浏览位置失败 channelId:%@ channelType:%d error:%@",channel.channelId?:@"",channel.channelType,db.lastErrorMessage);
+        }
     }];
+    return success;
 }
 
 -(void) removeReminderForType:(NSMutableArray*)reminders type:(NSInteger)type {
@@ -252,8 +285,13 @@ static WKConversationDB *_instance;
     }];
 }
 
--(void) updateConversation:(WKChannel*)channel title:(NSString*)title avatar:(NSString*) avatar db:(FMDatabase*)db {
-    [db executeUpdate:SQL_UPDATE_TITLEANDAVATAR,title?:@"",avatar?:@"",channel.channelId?:@"",@(channel.channelType)];
+// Round 38: 返回 YES 表示命中会话并写库成功
+-(BOOL) updateConversation:(WKChannel*)channel title:(NSString*)title avatar:(NSString*) avatar db:(FMDatabase*)db {
+    BOOL success = [db executeUpdate:SQL_UPDATE_TITLEANDAVATAR,title?:@"",avatar?:@"",channel.channelId?:@"",@(channel.channelType)] && [db changes] > 0;
+    if(!success) {
+        NSLog(@"WARN: 更新最近会话标题/头像失败 channelId:%@ channelType:%d error:%@",channel.channelId?:@"",channel.channelType,db.lastErrorMessage);
+    }
+    return success;
 }
 
 
@@ -319,6 +357,7 @@ static WKConversationDB *_instance;
 
 -(WKConversation*) recoveryConversation:(WKChannel*)channel {
      __block WKConversation *conversation;
+     __block BOOL recovered = NO;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
         FMResultSet *result = [db executeQuery:SQL_GET_IN_ALL,channel.channelId,@(channel.channelType)];
         if (result.next) {
@@ -327,10 +366,13 @@ static WKConversationDB *_instance;
         [result close];
         if(conversation) {
             conversation.isDeleted = 0;
-            [db executeUpdate:SQL_RECOVERY_CONVERSATION,channel.channelId,@(channel.channelType)];
+            recovered = [db executeUpdate:SQL_RECOVERY_CONVERSATION,channel.channelId?:@"",@(channel.channelType)] && [db changes] > 0;
+            if(!recovered) {
+                NSLog(@"WARN: 恢复最近会话失败 channelId:%@ channelType:%d error:%@",channel.channelId?:@"",channel.channelType,db.lastErrorMessage);
+            }
         }
     }];
-    return conversation;
+    return recovered ? conversation : nil;
 }
 
 -(WKConversation*) getConversationWithLastClientMsgNo:(NSString*)lastClientMsgNo {

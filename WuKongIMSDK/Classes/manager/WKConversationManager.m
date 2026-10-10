@@ -150,24 +150,33 @@
 //}
 
 -(void) clearConversationUnreadCount:(WKChannel*)channel {
-    // 清除指定频道消息未读数
-    [[WKConversationDB shared] clearConversationUnreadCount:channel];
-    // 通知UI层
-    [self callOnConversationUnreadCountUpdateDelegate:channel unreadCount:0];
+    // 清除指定频道消息未读数（Round 38：落库失败则不通知 UI，避免未落库却显示已读）
+    if([[WKConversationDB shared] clearConversationUnreadCount:channel]) {
+        // 通知UI层
+        [self callOnConversationUnreadCountUpdateDelegate:channel unreadCount:0];
+    }else {
+        NSLog(@"WARN: 清空最近会话未读数落库失败，跳过 UI 通知 channelId:%@ channelType:%d",channel.channelId?:@"",channel.channelType);
+    }
 }
 
 -(void) setConversationUnreadCount:(WKChannel*)channel unread:(NSInteger)unread {
-    // 设置指定频道消息未读数
-       [[WKConversationDB shared] setConversationUnreadCount:channel unread:unread];
-    // 通知UI层
-       [self callOnConversationUnreadCountUpdateDelegate:channel unreadCount:unread];
+    // 设置指定频道消息未读数（Round 38：落库失败则不通知 UI）
+    if([[WKConversationDB shared] setConversationUnreadCount:channel unread:unread]) {
+        // 通知UI层
+        [self callOnConversationUnreadCountUpdateDelegate:channel unreadCount:unread];
+    }else {
+        NSLog(@"WARN: 设置最近会话未读数落库失败，跳过 UI 通知 channelId:%@ channelType:%d unread:%ld",channel.channelId?:@"",channel.channelType,(long)unread);
+    }
 }
 
 -(void) deleteConversation:(WKChannel*)channel {
-    // 删除z最近会话
-    [[WKConversationDB shared] deleteConversation:channel];
-    // 通知UI层
-    [self callOnConversationDeleteDelegate:channel];
+    // 删除最近会话（Round 38：落库失败则不通知 UI，避免未删除却从列表移除）
+    if([[WKConversationDB shared] deleteConversation:channel]) {
+        // 通知UI层
+        [self callOnConversationDeleteDelegate:channel];
+    }else {
+        NSLog(@"WARN: 删除最近会话落库失败，跳过 UI 通知 channelId:%@ channelType:%d",channel.channelId?:@"",channel.channelType);
+    }
 }
 //
 //-(void)  removeReminder:(WKReminderType) type channel:(WKChannel*)channel {
