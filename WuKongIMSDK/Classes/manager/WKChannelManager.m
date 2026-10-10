@@ -228,7 +228,10 @@ static WKChannelManager *_instance;
             if([key isEqualToString:@"flame_second"] && setting[key] ) { // 阅后即焚
                 channelInfo.flameSecond = [setting[key] integerValue];
             }
-             [self updateChannelInfo:channelInfo];
+        }
+        // 所有字段应用完后只落库/回调一次（原实现把 updateChannelInfo: 写在循环体内，setting 有 N 个 key 就会落库并回调 N 次，且中间回调看到的是只应用了部分字段的频道信息）
+        if(setting.count > 0) {
+            [self updateChannelInfo:channelInfo];
         }
     }
 }

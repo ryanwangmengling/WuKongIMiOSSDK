@@ -759,12 +759,35 @@ Android 无对应 commit：Android 用 `?`/`ContentValues` 具名绑定，无此
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r21 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r21.log`）。本轮未新增文件，无需 `pod install`。
 - 修改后重新 grep 双引号拼接模式（`\"%@\"`）于 `WuKongIMSDK/Classes` → 0 命中。
 
+## Round 22 — 更新频道设置时循环内多次落库/回调修复（iOS 自有加固）（2026-10-09）
+
+### 22.1 背景
+`WKChannelManager updateChannelSetting:channel:setting:`（`manager/WKChannelManager.m:206-237`）把 `[self updateChannelInfo:channelInfo]` 写在 `for (NSString *key in setting.allKeys)` 循环体内。`updateChannelInfo:` 自身会 `queryChannelInfo`（读旧值）→ `WKChannelInfoDB updateChannelInfo`（写库）→ `setCache`（刷内存缓存）→ `callChannelInfoUpdateDelegate`（回调）。
+因此 `setting` 有 N 个 key 时会：
+- 落库 N 次（每次把内存对象的当前全量字段覆盖写一遍）；
+- `channelInfoUpdate` 委托被回调 N 次，且前 N-1 次回调看到的 `channelInfo` 只应用了部分字段（例如一次同时设置 `mute`/`stick`，会先回调「只改了 mute」再回调「改了 mute+stick」）。
+
+### 22.2 改动
+`manager/WKChannelManager.m`：把 `[self updateChannelInfo:channelInfo]` 移到 for 循环之后，并加 `if(setting.count > 0)` 守卫。所有字段先在内存对象上一次性应用，完成后再只落库/回调一次；`setting` 为空时保持原先「不落库、不回调」的行为。
+
+Android 无对应 commit：Android 侧无 `updateChannelSetting`/`ChannelSetting` 方法（全库 grep 0 命中），本轮记为 iOS 自有加固。
+
+### 22.3 判定不移植（本轮 Android 提交二次筛选）
+- `dc2b1a9`（fix:update cmd message）：Android 在同步最近会话转换、`MsgManager.WKSyncRecent2WKMsg`、`MessageHandler.handleReceiveMsg` 三处跳过 `WK_INSIDE_MSG`。iOS 用 `WK_CMD=99`（`WKConst.h:18`），`WKChatManager.m:610-613` 已用 `filterNoCMDAndNoStreamMessages:`（:675-679）过滤后再通知 delegate，:653/:666 单独处理 CMD；消息查询 SQL 也带 `content_type<>99`。无需移植。
+- `25caa7a`（修改收到信息先验证合法性再解码内容）：实为带字面冲突标记的 merge commit，内容属 Android 专用 payload 解码，不可移植。
+- PR #24/#25/#26 对应提交（`bdc02e2`/`a3b4ea0`/`594ccb2`/`8ec8e49`/`5b69519`/`f193f42`/`16f46f9`/`1a48603`）此前已逐一判定（iOS 由 `WKFMDatabaseQueue.isReady`+`WKDB.switchDB` openFailed+`closeOldQueueAsync` 覆盖 / `Assets/Migrations/202604150900.sql` 索引 / `WKDB.m:110-113` WAL 覆盖 / `intForQuery` 无对应 / 无 msgIds 分批）。
+- 其余未记录提交为 demo/readme/LICENSE/连接层重构家族/替换 sqlcipher native 库，无稳定性修复。Android 侧已基本穷尽。
+
+### 22.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r22 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r22.log`）。本轮未新增文件，无需 `pod install`。
+- Insert SQL 列/参数一致性普查（承接 R20）：`SQL_CHANNEL_SAVE`（`WKChannelInfoDB.m:12`，27 列）实参 :73/:86、`SQL_CHANNEL_UPDATE`（:14）实参 :95、`SQL_MEMBER_ADD`/`SQL_MEMBER_UPDATE_OR_ADD`（`WKChannelMemberDB.m:13/18`）实参 :142、`SQL_MESSAGE_EXTRA_INSERT_OR_UPDATE`（`WKMessageExtraDB.m:11`，15 列）实参 :67/:94、`SQL_ADD_UPDATE`(reminders)（`WKReminderDB.m:12`，12 列）实参 :64、`SQL_INSERT_REACTIONS`（`WKReactionDB.m:15`）实参 :93/:102 —— 列清单与实参逐条比对均一致，无第二处参数错位。
+
 ---
 ## 待办（后续轮次）
-- Round 22 候选（按优先级）：
+- Round 23 候选（按优先级）：
   1. `WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）。
   2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
   3. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
-  4. `WKRetryManager` 重发链路在「已删除消息」上的行为复查（R16 后 `getMessageWithMessageId:` 对已删除消息返回 nil，需确认 :251/:393 的 nil 分支不会误判为「消息不存在」而丢弃重试）。
-  5. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
+  4. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
+  5. `WKMediaManager` 的 `delegates`（NSHashTable）从未赋值、`addDelegate:`/`removeDelegate:` 为 no-op（R22 勘察发现，属死代码；确认无调用方后清理或补全 getter）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
