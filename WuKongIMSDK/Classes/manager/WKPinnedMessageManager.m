@@ -93,7 +93,11 @@ static WKPinnedMessageManager *_instance;
         }
     }
     
-    [WKPinnedMessageDB.shared addOrUpdatePinnedMessages:messages];
+    BOOL success = [WKPinnedMessageDB.shared addOrUpdatePinnedMessages:messages];
+    if(!success) {
+        NSLog(@"WARN: 置顶消息落库失败，跳过回调 数量:%lu",(unsigned long)messages.count);
+        return;
+    }
     
     for (WKChannel *channel in channels) {
         [self callOnDelegate:channel];

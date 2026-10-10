@@ -16,7 +16,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// 查询robot
 -(NSArray<WKRobot*>*) queryRobots:(NSArray<NSString*>*)robotIDs;
 
--(void) addOrUpdateRobots:(NSArray<WKRobot*>*)robots;
+-(BOOL) addOrUpdateRobots:(NSArray<WKRobot*>*)robots;
 
 -(WKRobot*) queryRobotWithUsername:(NSString*)username;
 

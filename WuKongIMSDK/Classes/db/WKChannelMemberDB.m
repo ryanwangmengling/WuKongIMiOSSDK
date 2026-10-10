@@ -160,7 +160,9 @@ static WKChannelMemberDB *_instance;
 
 -(void) deleteMembers:(WKChannel*)channel {
      [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-         [db executeUpdate:SQL_MEMBER_DELETE,channel.channelId,@(channel.channelType)];
+         if(![db executeUpdate:SQL_MEMBER_DELETE,channel.channelId?:@"",@(channel.channelType)]) {
+             NSLog(@"WARN: 删除频道成员失败 channelId:%@ error:%@",channel.channelId?:@"",db.lastErrorMessage);
+         }
      }];
 }
 
@@ -302,7 +304,9 @@ static WKChannelMemberDB *_instance;
             [placeholders addObject:@"?"];
             [args addObject:uid?:@""];
         }
-        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_UPDATE_MEMBER_STATUS,[placeholders componentsJoinedByString:@","]] withArgumentsInArray:args];
+        if(![db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_UPDATE_MEMBER_STATUS,[placeholders componentsJoinedByString:@","]] withArgumentsInArray:args]) {
+            NSLog(@"WARN: 更新成员状态失败 channelId:%@ status:%ld count:%lu error:%@",channel.channelId?:@"",(long)status,(unsigned long)uids.count,db.lastErrorMessage);
+        }
     }];
 }
 

@@ -77,7 +77,13 @@ static WKRobotManager *_instance;
             }
             return;
         }
-        [[WKRobotDB shared] addOrUpdateRobots:robots];
+        if(![[WKRobotDB shared] addOrUpdateRobots:robots]) {
+            NSLog(@"WARN: 机器人落库失败，未同步成功 数量:%lu",(unsigned long)robots.count);
+            if(complete) {
+                complete(false,[NSError errorWithDomain:@"机器人落库失败" code:0 userInfo:nil]);
+            }
+            return;
+        }
         if(complete) {
             complete(robots && robots.count>0,nil);
         }
@@ -130,7 +136,13 @@ static WKRobotManager *_instance;
             }
             return;
         }
-        [[WKRobotDB shared] addOrUpdateRobots:robots];
+        if(![[WKRobotDB shared] addOrUpdateRobots:robots]) {
+            NSLog(@"WARN: 机器人落库失败，未同步成功 数量:%lu",(unsigned long)robots.count);
+            if(complete) {
+                complete(false,[NSError errorWithDomain:@"机器人落库失败" code:0 userInfo:nil]);
+            }
+            return;
+        }
         if(complete) {
             complete(robots && robots.count>0,nil);
         }

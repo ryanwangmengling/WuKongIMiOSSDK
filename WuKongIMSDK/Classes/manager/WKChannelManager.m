@@ -238,6 +238,10 @@ static WKChannelManager *_instance;
 
 -(void) addOrUpdateChannelInfos:(NSArray<WKChannelInfo*>*) channelInfos {
      NSArray<WKChannelInfo*> *oldChannelInfos = [[WKChannelInfoDB shared] addOrUpdateChannelInfos:channelInfos];
+    if(!oldChannelInfos) {
+        NSLog(@"WARN: 频道信息批量入库失败，跳过缓存与回调 数量:%lu",(unsigned long)channelInfos.count);
+        return;
+    }
     if(channelInfos && channelInfos.count>0) {
         for (WKChannelInfo *channelInfo in channelInfos) {
             [self setCache:channelInfo];

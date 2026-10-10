@@ -67,12 +67,16 @@ static WKChannelInfoDB *_instance;
         NSLog(@"频道对象不能为空！保存失败！");
         return false;
     }
+    __block BOOL success = NO;
     [[[WKDB sharedDB] dbQueue] inDatabase:^(FMDatabase * _Nonnull db) {
         NSString *parentChannelID = channelInfo.parentChannel?channelInfo.parentChannel.channelId:@"";
         NSInteger parentChannelType = channelInfo.parentChannel?channelInfo.parentChannel.channelType:0;
-        [db executeUpdate:SQL_CHANNEL_SAVE,channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType),parentChannelID,@(parentChannelType),@(channelInfo.follow),channelInfo.name?:@"",channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond)];
+        success = [db executeUpdate:SQL_CHANNEL_SAVE,channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType),parentChannelID,@(parentChannelType),@(channelInfo.follow),channelInfo.name?:@"",channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond)];
+        if(!success) {
+            NSLog(@"WARN: 频道信息入库失败 channelId:%@ error:%@",channelInfo.channel.channelId?:@"",db.lastErrorMessage);
+        }
     }];
-    return true;
+    return success;
 }
 
 -(BOOL) saveChannelInfo:(WKChannelInfo*)channelInfo db:(FMDatabase*) db{
@@ -83,8 +87,11 @@ static WKChannelInfoDB *_instance;
     }
     NSString *parentChannelID = channelInfo.parentChannel?channelInfo.parentChannel.channelId:@"";
     NSInteger parentChannelType = channelInfo.parentChannel?channelInfo.parentChannel.channelType:0;
-    [db executeUpdate:SQL_CHANNEL_SAVE,channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType),parentChannelID,@(parentChannelType),@(channelInfo.follow),channelInfo.name?:@"",channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond)];
-    return true;
+    BOOL success = [db executeUpdate:SQL_CHANNEL_SAVE,channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType),parentChannelID,@(parentChannelType),@(channelInfo.follow),channelInfo.name?:@"",channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond)];
+    if(!success) {
+        NSLog(@"WARN: 频道信息入库失败 channelId:%@ error:%@",channelInfo.channel.channelId?:@"",db.lastErrorMessage);
+    }
+    return success;
 }
 
 -(void) updateChannelInfo:(WKChannelInfo*)channelInfo {
@@ -92,7 +99,9 @@ static WKChannelInfoDB *_instance;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
         NSString *parentChannelID = channelInfo.parentChannel?channelInfo.parentChannel.channelId:@"";
         NSInteger parentChannelType = channelInfo.parentChannel?channelInfo.parentChannel.channelType:0;
-        [db executeUpdate:SQL_CHANNEL_UPDATE,parentChannelID,@(parentChannelType),channelInfo.name?:@"",@(channelInfo.follow),channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond),channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType)];
+        if(![db executeUpdate:SQL_CHANNEL_UPDATE,parentChannelID,@(parentChannelType),channelInfo.name?:@"",@(channelInfo.follow),channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond),channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType)]) {
+            NSLog(@"WARN: 频道信息更新失败 channelId:%@ error:%@",channelInfo.channel.channelId?:@"",db.lastErrorMessage);
+        }
     }];
 }
 
@@ -102,26 +111,35 @@ static WKChannelInfoDB *_instance;
 
 -(void) updateChannelOnlineStatus:(WKChannel*)channel status:(WKOnlineStatus)status lastOffline:(NSTimeInterval)lastOffline mainDeviceFlag:(WKDeviceFlagEnum)mainDeviceFlag{
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
+        BOOL success = NO;
         if(status == WKOnlineStatusOnline) {
-             [db executeUpdate:SQL_CHANNEL_ONLINESTATUS_UPDATE_NO_LAST_OFFLINE,@(status),@(mainDeviceFlag),channel.channelId?:@"",@(channel.channelType)];
+             success = [db executeUpdate:SQL_CHANNEL_ONLINESTATUS_UPDATE_NO_LAST_OFFLINE,@(status),@(mainDeviceFlag),channel.channelId?:@"",@(channel.channelType)];
         }else {
-             [db executeUpdate:SQL_CHANNEL_ONLINESTATUS_UPDATE,@(status),@(lastOffline),@(mainDeviceFlag),channel.channelId?:@"",@(channel.channelType)];
+             success = [db executeUpdate:SQL_CHANNEL_ONLINESTATUS_UPDATE,@(status),@(lastOffline),@(mainDeviceFlag),channel.channelId?:@"",@(channel.channelType)];
         }
-       
+        if(!success) {
+            NSLog(@"WARN: 频道在线状态更新失败 channelId:%@ status:%ld error:%@",channel.channelId?:@"",(long)status,db.lastErrorMessage);
+        }
     }];
 }
 
 
 -(void) deleteChannelInfo:(WKChannel*)channel {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_CHANNEL_DELETE,channel.channelId,@(channel.channelType)];
+        if(![db executeUpdate:SQL_CHANNEL_DELETE,channel.channelId,@(channel.channelType)]) {
+            NSLog(@"WARN: 删除频道信息失败 channelId:%@ error:%@",channel.channelId?:@"",db.lastErrorMessage);
+        }
     }];
 }
 
--(void) updateChannelInfo:(WKChannelInfo*)channelInfo db:(FMDatabase*)db {
+-(BOOL) updateChannelInfo:(WKChannelInfo*)channelInfo db:(FMDatabase*)db {
     NSString *parentChannelID = channelInfo.parentChannel?channelInfo.parentChannel.channelId:@"";
     NSInteger parentChannelType = channelInfo.parentChannel?channelInfo.parentChannel.channelType:0;
-    [db executeUpdate:SQL_CHANNEL_UPDATE,parentChannelID,@(parentChannelType),channelInfo.name?:@"",@(channelInfo.follow),channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond),channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType)];
+    BOOL success = [db executeUpdate:SQL_CHANNEL_UPDATE,parentChannelID,@(parentChannelType),channelInfo.name?:@"",@(channelInfo.follow),channelInfo.notice?:@"",channelInfo.logo?:@"",channelInfo.remark?:@"",@(channelInfo.stick),@(channelInfo.mute),@(channelInfo.showNick),@(channelInfo.save),@(channelInfo.forbidden),@(channelInfo.invite),[self extraToStr:channelInfo.extra],@(channelInfo.status),@(channelInfo.online),@(channelInfo.receipt),@(channelInfo.robot),@(channelInfo.lastOffline),@(channelInfo.deviceFlag),channelInfo.category?:@"",@(channelInfo.beDeleted),@(channelInfo.beBlacklist),@(channelInfo.flame),@(channelInfo.flameSecond),channelInfo.channel.channelId?:@"",@(channelInfo.channel.channelType)];
+    if(!success) {
+        NSLog(@"WARN: 频道信息更新失败 channelId:%@ error:%@",channelInfo.channel.channelId?:@"",db.lastErrorMessage);
+    }
+    return success;
 }
 
 -(WKChannelInfo*) queryChannelInfo:(WKChannel*)channel {
@@ -294,21 +312,37 @@ static WKChannelInfoDB *_instance;
 -(NSArray<WKChannelInfo*>*) addOrUpdateChannelInfos:(NSArray<WKChannelInfo*>*)channelInfos {
     NSLog(@"-------------addOrUpdateChannelInfos------------>");
     if(!channelInfos || channelInfos.count<=0) {
+        return @[];
+    }
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 频道信息批量入库失败：数据库不可用，数量:%lu",(unsigned long)channelInfos.count);
         return nil;
     }
-     __block NSMutableArray *oldChannelInfos = [NSMutableArray array];
-     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-         for (WKChannelInfo *channelInfo in channelInfos) {
-             WKChannelInfo *oldChannelInfo = [self queryChannelInfo:channelInfo.channel db:db];
-             if(oldChannelInfo) {
-                 [oldChannelInfos addObject:oldChannelInfo];
-                 [self updateChannelInfo:channelInfo db:db];
-             }else {
-                 [self saveChannelInfo:channelInfo db:db];
-             }
-         }
-        
-     }];
+    __block NSMutableArray *oldChannelInfos = [NSMutableArray array];
+    __block BOOL success = YES;
+    [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
+        for (WKChannelInfo *channelInfo in channelInfos) {
+            WKChannelInfo *oldChannelInfo = [self queryChannelInfo:channelInfo.channel db:db];
+            if(oldChannelInfo) {
+                if(![self updateChannelInfo:channelInfo db:db]) {
+                    success = NO;
+                    *rollback = YES;
+                    return;
+                }
+                [oldChannelInfos addObject:oldChannelInfo];
+            }else {
+                if(![self saveChannelInfo:channelInfo db:db]) {
+                    success = NO;
+                    *rollback = YES;
+                    return;
+                }
+            }
+        }
+    }];
+    if(!success) {
+        NSLog(@"WARN: 频道信息批量入库失败已回滚 数量:%lu",(unsigned long)channelInfos.count);
+        return nil;
+    }
     return oldChannelInfos;
 }
 

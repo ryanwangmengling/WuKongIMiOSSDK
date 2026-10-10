@@ -93,10 +93,15 @@ static WKRobotDB *_instance;
     return robot;
 }
 
--(void) addOrUpdateRobots:(NSArray<WKRobot*>*)robots {
+-(BOOL) addOrUpdateRobots:(NSArray<WKRobot*>*)robots {
     if(!robots || robots.count<=0) {
-        return;
+        return YES;
     }
+    if([[WKDB sharedDB] dbQueue] == nil) {
+        NSLog(@"WARN: 机器人入库失败：数据库不可用 数量:%lu",(unsigned long)robots.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [[[WKDB sharedDB] dbQueue] inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKRobot *robot in robots) {
             NSString *menusStr = @"";
@@ -104,10 +109,16 @@ static WKRobotDB *_instance;
                 menusStr = [self toJSON:robot.menus];
             }
             
-            [db executeUpdate:SQL_ROBOTS_INSERT_OR_UPDATE,robot.robotID?:@"",@(robot.version),@(robot.status),@(robot.inlineOn),robot.placeholder?:@"",menusStr,robot.username?:@""];
+            if(![db executeUpdate:SQL_ROBOTS_INSERT_OR_UPDATE,robot.robotID?:@"",@(robot.version),@(robot.status),@(robot.inlineOn),robot.placeholder?:@"",menusStr,robot.username?:@""]) {
+                success = NO;
+                NSLog(@"WARN: 机器人入库失败已回滚 robotID:%@ error:%@",robot.robotID?:@"",db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
        
     }];
+    return success;
 }
 
 -(NSString*) toJSON:(NSArray<WKRobotMenus*> *) menusList {

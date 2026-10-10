@@ -78,25 +78,40 @@ static WKPinnedMessageDB *_instance;
 
 -(void) deletePinnedByChannel:(WKChannel*)channel {
     [WKDB.sharedDB.dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-         [db executeUpdate:SQL_PINNED_MESSAGE_DELETE_WITH_CHANNEL,channel.channelId?:@"",@(channel.channelType)];
+         if(![db executeUpdate:SQL_PINNED_MESSAGE_DELETE_WITH_CHANNEL,channel.channelId?:@"",@(channel.channelType)]) {
+             NSLog(@"WARN: 删除频道置顶消息失败 channelId:%@ error:%@",channel.channelId?:@"",db.lastErrorMessage);
+         }
     }];
 }
 
 -(void) deletePinnedByMessageId:(uint64_t)messageId {
     [WKDB.sharedDB.dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_PINNED_MESSAGE_DELETE_WITH_MESSAGE_ID,@(messageId)];
+        if(![db executeUpdate:SQL_PINNED_MESSAGE_DELETE_WITH_MESSAGE_ID,@(messageId)]) {
+            NSLog(@"WARN: 删除置顶消息失败 messageId:%llu error:%@",messageId,db.lastErrorMessage);
+        }
     }];
 }
 
--(void) addOrUpdatePinnedMessages:(NSArray<WKPinnedMessage*>*)messages {
+-(BOOL) addOrUpdatePinnedMessages:(NSArray<WKPinnedMessage*>*)messages {
     if(!messages || messages.count==0) {
-        return;
+        return YES;
     }
+    if(WKDB.sharedDB.dbQueue == nil) {
+        NSLog(@"WARN: 置顶消息入库失败：数据库不可用 数量:%lu",(unsigned long)messages.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [WKDB.sharedDB.dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKPinnedMessage *message in messages) {
-            [db executeUpdate:SQL_PINNED_MESSAGE_ADD_OR_UPDATE,@(message.messageId),@(message.messageSeq),message.channel.channelId?:@"",@(message.channel.channelType),@(message.version),@(message.isDeleted)];
+            if(![db executeUpdate:SQL_PINNED_MESSAGE_ADD_OR_UPDATE,@(message.messageId),@(message.messageSeq),message.channel.channelId?:@"",@(message.channel.channelType),@(message.version),@(message.isDeleted)]) {
+                success = NO;
+                NSLog(@"WARN: 置顶消息入库失败已回滚 messageId:%llu error:%@",message.messageId,db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
     }];
+    return success;
 }
 
 -(WKPinnedMessage*) getPinnedMessageByMessageId:(uint64_t)messageId {

@@ -92,12 +92,19 @@ static WKCMDDB *_instance;
 
 
 -(void) replaceCMDMessages:(NSArray<WKCMDMessage*>*)messages {
+    if(!messages || messages.count==0) {
+        return;
+    }
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKCMDMessage *message in messages) {
             NSString *cmd = message.cmd?:@"";
             NSString *paramStr = message.param?:@"";
            
-            [db executeUpdate:SQL_CMD_REPLACE,@(message.messageId),@(message.messageSeq),message.clientMsgNo?:@"",@(message.timestamp),cmd,paramStr];
+            if(![db executeUpdate:SQL_CMD_REPLACE,@(message.messageId),@(message.messageSeq),message.clientMsgNo?:@"",@(message.timestamp),cmd,paramStr]) {
+                NSLog(@"WARN: CMD 消息入库失败已回滚 messageId:%llu error:%@",message.messageId,db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
     }];
 }
@@ -120,7 +127,9 @@ static WKCMDDB *_instance;
         return;
     }
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_CMD_DELETE_WITH_IDS,[ids componentsJoinedByString:@","]]];
+        if(![db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_CMD_DELETE_WITH_IDS,[ids componentsJoinedByString:@","]]]) {
+            NSLog(@"WARN: 删除 CMD 消息失败 数量:%lu error:%@",(unsigned long)ids.count,db.lastErrorMessage);
+        }
     }];
 }
 

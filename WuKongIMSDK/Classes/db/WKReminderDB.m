@@ -141,13 +141,17 @@ static WKReminderDB *_instance;
         return;
     }
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_UPDATE_DONE,[ids componentsJoinedByString:@","]],@([[NSDate date] timeIntervalSince1970])];
+        if(![db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_UPDATE_DONE,[ids componentsJoinedByString:@","]],@([[NSDate date] timeIntervalSince1970])]) {
+            NSLog(@"WARN: 提醒项置完成失败 count:%lu error:%@",(unsigned long)ids.count,db.lastErrorMessage);
+        }
     }];
 }
 
 -(void) updateExpireDoneUploadStatusFail:(NSInteger)expireTime {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_UPDATE_UPLOAD_FAIL,@(expireTime)];
+        if(![db executeUpdate:SQL_UPDATE_UPLOAD_FAIL,@(expireTime)]) {
+            NSLog(@"WARN: 提醒项上传状态批量置失败失败 error:%@",db.lastErrorMessage);
+        }
     }];
 }
 
@@ -165,7 +169,9 @@ static WKReminderDB *_instance;
 
 -(void) updateUploadStatus:(WKReminderUploadStatus)status reminderID:(NSNumber*)reminderID {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_UPDATE_UPLOAD_STATIS,@(status),reminderID];
+        if(![db executeUpdate:SQL_UPDATE_UPLOAD_STATIS,@(status),reminderID]) {
+            NSLog(@"WARN: 提醒项上传状态更新失败 reminderID:%@ status:%ld error:%@",reminderID,(long)status,db.lastErrorMessage);
+        }
     }];
 }
 

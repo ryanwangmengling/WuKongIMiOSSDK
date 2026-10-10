@@ -37,7 +37,9 @@ static WKConversationExtraDB *_instance;
 
 -(void) updateVersion:(WKChannel*)channel version:(int64_t)version {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_UPDATE_VERSION,@(version),channel.channelId,@(channel.channelType)];
+        if(![db executeUpdate:SQL_UPDATE_VERSION,@(version),channel.channelId?:@"",@(channel.channelType)]) {
+            NSLog(@"WARN: 更新会话扩展版本失败 channelId:%@ error:%@",channel.channelId?:@"",db.lastErrorMessage);
+        }
     }];
 }
 

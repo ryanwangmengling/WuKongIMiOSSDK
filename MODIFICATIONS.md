@@ -1349,9 +1349,68 @@ C. 让根因可观测：
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r40 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r40.log`。本轮未新增文件，无需 `pod install`。
 
 ---
+## Round 41 — 频道信息批量入库原子化 + 置顶/机器人/CMD 批量写回滚 + 单条写失败不再静默（2026-10-16）
+
+### 41.1 背景
+- 承接 R32–R40「失败不得谎报成功 / 失败必须可观测」主线，本轮继续「单条写失败可观测」扫尾，并首次覆盖 `WKChannelInfoDB`、`WKPinnedMessageDB`、`WKRobotDB`、`WKCMDDB` 的批量事务。
+- `WKChannelInfoDB.addOrUpdateChannelInfos:`（:294-313）用 `inDatabase:`（非事务）逐条调 `updateChannelInfo:db:`/`saveChannelInfo:db:` 且不接返回值 → 批次中途失败部分提交；`saveChannelInfo:`/`saveChannelInfo:db:` 结尾无条件 `return true`，`updateChannelInfo:db:` 丢返回值；上层 `WKChannelManager.addOrUpdateChannelInfos:` 仍无条件 `setCache` + `callChannelInfoUpdateDelegate:` → DB 未落库却通知 UI。
+- `WKPinnedMessageDB.addOrUpdatePinnedMessages:`（:91-100）`inTransaction:` 内逐条 executeUpdate 不置 rollback → 部分提交；调用方 `WKPinnedMessageManager` 落库后对涉及频道全部 `callOnDelegate:`。
+- `WKRobotDB.addOrUpdateRobots:`（:96-111）同款事务不置 rollback；`WKRobotManager` 落库后无条件 `complete(robots&&robots.count>0,nil)` → 谎报同步成功。
+- `WKCMDDB.replaceCMDMessages:`（:94-103）同款事务不置 rollback。
+- 其余单条写丢弃返回值：`WKChannelInfoDB.updateChannelInfo:`/`updateChannelOnlineStatus:...`/`deleteChannelInfo:`、`WKPinnedMessageDB.deletePinnedByChannel:`/`deletePinnedByMessageId:`、`WKCMDDB.deleteCMDMessagesWithIDs:`、`WKChannelMemberDB.deleteMembers:`/`updateMemberStatus:channel:uids:`、`WKConversationExtraDB.updateVersion:version:`、`WKReminderDB.updateDone:`/`updateExpireDoneUploadStatusFail:`/`updateUploadStatus:reminderID:`。
+
+### 41.2 Android 对照
+- `db/RobotDBManager.java`（:120-139 `insertRobots`）用 `beginTransaction` + `setTransactionSuccessful` + `endTransaction`，本身就是「整批原子」意图；iOS 对应方法缺 rollback，本轮补齐 parity。
+- Android 的 sqlcipher 事务在异常时 `endTransaction` 自动回滚；**iOS FMDB 的 `inTransaction:` 不会因 `executeUpdate` 返回 NO 自动回滚，必须显式 `*rollback = YES`** —— 这是本轮事务补齐的 parity 依据。
+- Android **无 PinnedMessage 管理器**（`grep PinnedMessage` = 0）→ 置顶消息为 iOS 自有缺陷，无对标 commit。
+- Android 相关类 `ChannelDBManager`、`ChannelMembersDbManager`、`ReminderDBManager`、`ConversationDbManager`；本轮无直接对应 commit。
+
+### 41.3 改动（11 个文件）
+一、`db/WKChannelInfoDB.m`
+- `saveChannelInfo:`（:64-80）：改 `__block BOOL success = NO;`，block 内 `success = [db executeUpdate:SQL_CHANNEL_SAVE,...]`，失败 WARN「频道信息入库失败 channelId:%@ error:%@」，`return success;`（原无条件 `return true`）。
+- `saveChannelInfo:db:`（:82-95）：`BOOL success = [db executeUpdate:...]` + 失败 WARN + `return success;`。
+- `updateChannelInfo:`（:97-106）：`if(![db executeUpdate:SQL_CHANNEL_UPDATE,...])` + WARN「频道信息更新失败」。
+- `updateChannelOnlineStatus:...mainDeviceFlag:`（:112-124）：`BOOL success = NO;`，两分支分别接住 `SQL_CHANNEL_ONLINESTATUS_UPDATE_NO_LAST_OFFLINE` / `SQL_CHANNEL_ONLINESTATUS_UPDATE`，失败 WARN「频道在线状态更新失败」。
+- `deleteChannelInfo:`（:127-133）：`if(!...)` + WARN「删除频道信息失败」。
+- `updateChannelInfo:db:`（:135-144）：返回类型 `void` → `BOOL`，`BOOL success = [db executeUpdate:SQL_CHANNEL_UPDATE,...]` + 失败 WARN + `return success;`。
+- `addOrUpdateChannelInfos:`（:312 起）：空数组 `return @[]`；`dbQueue == nil` WARN + `return nil`；`inDatabase:` 改 `inTransaction:`；`__block BOOL success = YES`；逐条 `queryChannelInfo:channelInfo.channel db:db` 后 `if(![self updateChannelInfo:channelInfo db:db])` / `if(![self saveChannelInfo:channelInfo db:db])` 失败则 `success = NO; *rollback = YES; return;`；失败 WARN「频道信息批量入库失败已回滚 数量:%lu」+ `return nil`，成功 `return oldChannelInfos`。
+二、`manager/WKChannelManager.m`
+- `addOrUpdateChannelInfos:`（:239-257）：DB 返回 nil 时 WARN「频道信息批量入库失败，跳过缓存与回调 数量:%lu」并 return，不再 `setCache` + `callChannelInfoUpdateDelegate:`。
+三、`db/WKPinnedMessageDB.h` / `.m`
+- `.h:33`：`addOrUpdatePinnedMessages:` `void` → `BOOL`。
+- `deletePinnedByChannel:`（:79-83）/`deletePinnedByMessageId:`（:85-89）：接住返回值 + WARN「删除频道置顶消息失败」/「删除置顶消息失败 messageId:%llu」。
+- `addOrUpdatePinnedMessages:`（:91-100）：改 BOOL；空数组 `return YES`；dbQueue nil WARN + `return NO`；逐条失败 `*rollback = YES; return;`，WARN「置顶消息入库失败已回滚 messageId:%llu error:%@」。
+四、`manager/WKPinnedMessageManager.m`
+- `addOrUpdatePinnedMessages:`（:96 起）：接住 BOOL，失败 WARN「置顶消息落库失败，跳过回调 数量:%lu」并 return，仅成功才 `callOnDelegate:`。
+五、`db/WKRobotDB.h` / `.m`
+- `.h:19`：`addOrUpdateRobots:` `void` → `BOOL`。
+- `addOrUpdateRobots:`（:96-111）：改 BOOL；空数组 `return YES`；dbQueue nil `return NO`；逐条失败 `*rollback = YES; return;`，WARN「机器人入库失败已回滚 robotID:%@ error:%@」。
+六、`manager/WKRobotManager.m`
+- `:80`、`:139` 两处：接住 BOOL，失败 WARN「机器人落库失败，未同步成功 数量:%lu」并 `complete(false, NSError)`，不再谎报 `complete(robots&&robots.count>0,nil)`。
+七、`db/WKCMDDB.m`
+- `replaceCMDMessages:`（:94-111）：加空数组早退；`if(![db executeUpdate:SQL_CMD_REPLACE,...])` 失败 WARN「CMD 消息入库失败已回滚 messageId:%llu error:%@」+ `*rollback = YES; return;`。
+- `deleteCMDMessagesWithIDs:`（:118-125）：接住返回值 + WARN「删除 CMD 消息失败 数量:%lu error:%@」。
+八、`db/WKChannelMemberDB.m`
+- `deleteMembers:`（:161-165）：接住返回值 + WARN「删除频道成员失败 channelId:%@ error:%@」。
+- `updateMemberStatus:channel:uids:`（:293-307）：接住返回值 + WARN「更新成员状态失败 channelId:%@ status:%ld count:%lu error:%@」。
+九、`db/WKConversationExtraDB.m`
+- `updateVersion:version:`（:38-42）：接住返回值 + WARN「更新会话扩展版本失败 channelId:%@ error:%@」。
+十、`db/WKReminderDB.m`
+- `updateDone:`（:139-146）/`updateExpireDoneUploadStatusFail:`（:148-152）/`updateUploadStatus:reminderID:`（:166-170）：接住返回值 + WARN「提醒项置完成失败」/「提醒项上传状态批量置失败失败」/「提醒项上传状态更新失败」。
+
+### 41.4 判定
+- 批量方法选 `BOOL + *rollback`（而非仅 WARN）：与 R33/R39 既有模式一致，保证「要么整批成功、要么整批不落库」。
+- 单条写方法保持 `void`（仅 `WKChannelInfoDB.updateChannelInfo:db:` 因被批量方法复用而改 BOOL）：调用方拿到失败也无补偿动作，下层 WARN 已可观测（同 R37/R39 判定）。
+- `WKChannelInfoDB.updateChannelInfo:db:`/`saveChannelInfo:db:` 未在任何 .h 声明（仅 .m 内定义于 addOrUpdateChannelInfos 之前），故无需同步头文件；`queryChannelInfo:db:` 声明于 `WKChannelInfoDB.h:85`。
+- `WKChannelInfoDB.updateChannelInfo:`（无 db 重载）保持 void：`WKChannelManager` 调用方无补偿动作。
+
+### 41.5 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r41 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r41.log`。本轮未新增文件，无需 `pod install`。
+
+---
 ## 待办（后续轮次）
-- Round 41 候选（按优先级）：
-  1. 继续「单条写失败可观测」扫尾（R40 转做 JSON 校验，此项顺延）：`WKChannelInfoDB`（:73/:86 `SQL_CHANNEL_SAVE`、:95/:124 `SQL_CHANNEL_UPDATE`、:106/:108 在线状态）、`WKPinnedMessageDB`（:81/:87/:97）、`WKReminderDB`（:144/:150/:168）、`WKConversationExtraDB.updateVersion:`（:40）、`WKChannelMemberDB.deleteMembers:`（:163）/`updateMemberStatus...`（:305）、`WKCMDDB`（:100/:123）、`WKRobotDB`（:107）、`WKMessageExtraDB` 剩余、`WKDB.m`（:113 `PRAGMA` / :187 `DELETE FROM schema_migrations` 可忽略）。
+- Round 42 候选（按优先级）：
+  1. 「单条写失败可观测」扫尾已基本完成（R37–R41）：仅剩 `WKMessageExtraDB` 剩余项与 `WKDB.m`（:113 `PRAGMA` / :187 `DELETE FROM schema_migrations` 可忽略）——无实际收益。
   2. JSON 反序列化类型校验扫尾：再 grep 全项目 `JSONObjectWithData:`，确认无「只判 `!error` 即当字典用」的残留（`@try/@catch` 外为重点）。
   3. 跨表事务「部分提交」面：`WKMessageDB.saveMessages:`/`replaceMessages:` 内 `addOrUpdateMessageExtra:db:`（R39 已加 WARN）、`insertOrUpdateReactions:db:`、`saveOrUpdateStreams:db:` 失败只 WARN、不回滚；是否整条回滚需权衡（回滚会丢弃已成功的主消息行）。
   4. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。

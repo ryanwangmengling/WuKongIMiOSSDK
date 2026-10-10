@@ -30,7 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
 -(WKPinnedMessage*) getPinnedMessageByMessageId:(uint64_t)messageId;
 
 // 添加或更新置顶消息
--(void) addOrUpdatePinnedMessages:(NSArray<WKPinnedMessage*>*)messages;
+-(BOOL) addOrUpdatePinnedMessages:(NSArray<WKPinnedMessage*>*)messages;
 
 // 根据消息id查询是否置顶
 -(BOOL) hasPinned:(uint64_t)messageId;
