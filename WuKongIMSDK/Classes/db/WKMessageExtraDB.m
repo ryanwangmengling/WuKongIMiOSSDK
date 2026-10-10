@@ -198,7 +198,7 @@ static WKMessageExtraDB *_instance;
         messageExtra.contentEditData = contentEditData;
         __autoreleasing NSError *error = nil;
         NSDictionary *contentEditDict = [NSJSONSerialization JSONObjectWithData:contentEditData options:kNilOptions error:&error];
-        if(!error && contentEditDict) {
+        if(!error && [contentEditDict isKindOfClass:[NSDictionary class]]) {
             NSInteger contentType = [contentEditDict[@"type"] integerValue];
             messageExtra.contentEdit = [[WKMessageDB shared] decodeContent:contentType data:contentEditData db:db];
         }
@@ -207,7 +207,8 @@ static WKMessageExtraDB *_instance;
     if(extraStr && ![extraStr isEqualToString:@""]) {
         __autoreleasing NSError *error = nil;
         NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
-        if(!error) {
+        // 仅接受 JSON 对象，数组/NSNull 赋给字典属性会让下游取下标崩溃（Round 40，同 R34 WKMessageDB.toMessage:）
+        if(!error && [extraDictionary isKindOfClass:[NSDictionary class]]) {
             messageExtra.extra = extraDictionary;
         }
     }

@@ -244,7 +244,8 @@ static WKReminderDB *_instance;
     if(data) {
         __autoreleasing NSError *error = nil;
         NSDictionary *dataDictionary = [NSJSONSerialization JSONObjectWithData:[data dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
-        if(!error) {
+        // 仅接受 JSON 对象，数组/NSNull 赋给字典属性会让下游取下标崩溃（Round 40）
+        if(!error && [dataDictionary isKindOfClass:[NSDictionary class]]) {
             reminder.data = dataDictionary;
         }
     }

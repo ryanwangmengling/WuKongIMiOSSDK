@@ -103,7 +103,17 @@
     
     for (WKCMDMessage *cmdMessage in cmdMessages) {
         WKCMDModel *cmdModel = [WKCMDModel cmdMessage:cmdMessage];
-        NSDictionary *param = [NSJSONSerialization JSONObjectWithData:[cmdMessage.param dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:nil];
+        // param 可能为 NULL（老数据），[nil dataUsingEncoding:] 得到 nil 会让 JSONObjectWithData: 抛异常；
+        // 且必须确保解析结果是 JSON 对象，数组/NSNull 赋值后下游取下标会崩（Round 40）
+        NSDictionary *param = nil;
+        if([cmdMessage.param isKindOfClass:[NSString class]] && cmdMessage.param.length>0) {
+            id parsed = [NSJSONSerialization JSONObjectWithData:[cmdMessage.param dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:nil];
+            if([parsed isKindOfClass:[NSDictionary class]]) {
+                param = parsed;
+            }else {
+                NSLog(@"WARN: cmd param 非 JSON 对象，忽略 cmd:%@",cmdMessage.cmd);
+            }
+        }
         cmdModel.param = param;
         [self callOnCMDDelegate:cmdModel];
     }

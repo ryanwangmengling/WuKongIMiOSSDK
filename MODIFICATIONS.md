@@ -1314,13 +1314,49 @@ C. 让根因可观测：
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r39 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r39.log`。本轮未新增文件，无需 `pod install`。
 
 ---
+## Round 40 — JSON 反序列化结果类型校验遗漏（R34 补漏）（2026-10-15）
+
+### 40.1 背景
+- R34 修复了「JSON 序列化失败返回 nil 后被当作字典使用」，但只覆盖 3 处（`WKConversationDB.m:484`、`WKChannelInfoDB.m:370`、`WKMessageDB.m:1214`），遗漏同类模式：`[NSJSONSerialization JSONObjectWithData:options:error:]` 只判 `!error` 就当作 `NSDictionary` 使用。
+- iOS 的 `JSONObjectWithData:` 对 **JSON 数组 / NSNull / 数字 / 字符串** 不报错，而是分别返回 `NSArray` / `NSNull` / `NSNumber` / `NSString`。随后一旦做字典下标 `obj[@"k"]`、`[NSDictionary dictionaryWithDictionary:]` 或快速枚举，就会抛 `NSInvalidArgumentException` 崩溃；**服务端或历史脏数据可控**，属可被外部触发的崩溃面。
+- 本轮补齐 db 与 manager 中所有「只判 error、不判类型」的调用点，并顺带修两处「nil 字符串先构造 data，再对 nil 调 `JSONObjectWithData:` 直接抛异常」的点。
+
+### 40.2 Android 对照
+- **无直接对标**：Android 用 `new JSONObject(str)`，非对象 JSON 抛 `JSONException` 并被上层 try/catch，不存在「静默拿到非对象再崩溃」的等价路径。
+- 本轮是 iOS 运行时 JSON 模型差异导致的自有加固；Android 无对应 commit。
+
+### 40.3 改动（8 个文件 / 10 处）
+一、远端可控路径（优先级最高）
+- `manager/WKChatManager.m`（`decodeContent:contentType:`，约 :1542-1548）：`contentDict` 非空后补 `isKindOfClass:[NSDictionary class]`，非字典时 `WARN: 消息内容非 JSON 对象，跳过解码！class:%@` 并 `return nil`，避免 `contentDict[@"type"]` 崩溃。
+- `db/WKMessageDB.m`（`toStream:`，:1092 起）：条件改为 `!error && [contentDictionary isKindOfClass:[NSDictionary class]] && contentDictionary[@"type"]`。
+二、DB 反序列化（历史 / 脏数据）
+- `db/WKMessageExtraDB.m:201`：`contentEditDict` 增加 `NSDictionary` 类型判断。
+- `db/WKMessageExtraDB.m:210`：`extraDictionary` 增加 `NSDictionary` 类型判断。
+- `db/WKReminderDB.m:247`：`dataDictionary` 增加 `NSDictionary` 类型判断。
+- `db/WKChannelMemberDB.m:382`：`extraDictionary` 增加 `NSDictionary` 类型判断（否则 `dictionaryWithDictionary:` 对数组直接抛）。
+- `db/WKRobotDB.m:143` 起：`menusDicts` 增加 `NSArray` 类型判断；循环内元素补 `isKindOfClass:[NSDictionary class]`，非字典 `continue`。
+三、manager 解析入口
+- `manager/WKMOSContentConvertManager.m:106`：`dic` 增加 `NSDictionary` 类型判断后再取 `quoteMsgNo`。
+- `manager/WKMOSContentConvertManager.m:228` 起：先判断 `contentStr` 是长度 > 0 的 `NSString` 才解析，且仅当解析结果是 `NSDictionary` 才赋值。
+- `manager/WKCMDManager.m:104` 起：仅当 `cmdMessage.param` 是长度 > 0 的 `NSString` 才解析，且结果必须是 `NSDictionary` 才赋给 `cmdModel.param`，否则 `WARN: cmd param 非 JSON 对象，忽略 cmd:%@` 并置 nil。
+
+### 40.4 判定
+- 已守卫的 `WKConversationDB.m:484` / `WKChannelInfoDB.m:370` / `WKMessageDB.m:1214` 保持不动。
+- `model/content/WKMessageContent.m:142` 的同类解析位于 `@try/@catch` 内、崩溃会被兜住，本轮不改，避免无谓改动面。
+- `WKMOSContentConvertManager.m:228` / `WKCMDManager.m:104` 除类型判断外还补「nil 字符串不构造 data」的前置守卫：原实现对 nil 调 `dataUsingEncoding:` 得到 nil，再对 nil 调 `JSONObjectWithData:` 会抛异常，与类型问题同属崩溃面。
+
+### 40.5 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r40 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r40.log`。本轮未新增文件，无需 `pod install`。
+
+---
 ## 待办（后续轮次）
-- Round 40 候选（按优先级）：
-  1. 继续「单条写失败可观测」扫尾（按优先级）：`WKChannelInfoDB`（:73/:86 `SQL_CHANNEL_SAVE`、:95/:124 `SQL_CHANNEL_UPDATE`、:106/:108 在线状态）、`WKPinnedMessageDB`（:81/:87/:97）、`WKReminderDB`（:144/:150/:168）、`WKConversationExtraDB.updateVersion:`（:40）、`WKChannelMemberDB.deleteMembers:`（:163）/`updateMemberStatus...`（:305）、`WKCMDDB`（:100/:123）、`WKRobotDB`（:107）、`WKMessageExtraDB` 剩余、`WKDB.m`（:113 `PRAGMA` / :187 `DELETE FROM schema_migrations` 可忽略）。
-  2. 跨表事务「部分提交」面：`WKMessageDB.saveMessages:`/`replaceMessages:` 内 `addOrUpdateMessageExtra:db:`（R39 已加 WARN）、`insertOrUpdateReactions:db:`、`saveOrUpdateStreams:db:` 失败只 WARN、不回滚；是否整条回滚需权衡（回滚会丢弃已成功的主消息行）。
-  3. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。
-  4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
-  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
-  6. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
-  7. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口。
+- Round 41 候选（按优先级）：
+  1. 继续「单条写失败可观测」扫尾（R40 转做 JSON 校验，此项顺延）：`WKChannelInfoDB`（:73/:86 `SQL_CHANNEL_SAVE`、:95/:124 `SQL_CHANNEL_UPDATE`、:106/:108 在线状态）、`WKPinnedMessageDB`（:81/:87/:97）、`WKReminderDB`（:144/:150/:168）、`WKConversationExtraDB.updateVersion:`（:40）、`WKChannelMemberDB.deleteMembers:`（:163）/`updateMemberStatus...`（:305）、`WKCMDDB`（:100/:123）、`WKRobotDB`（:107）、`WKMessageExtraDB` 剩余、`WKDB.m`（:113 `PRAGMA` / :187 `DELETE FROM schema_migrations` 可忽略）。
+  2. JSON 反序列化类型校验扫尾：再 grep 全项目 `JSONObjectWithData:`，确认无「只判 `!error` 即当字典用」的残留（`@try/@catch` 外为重点）。
+  3. 跨表事务「部分提交」面：`WKMessageDB.saveMessages:`/`replaceMessages:` 内 `addOrUpdateMessageExtra:db:`（R39 已加 WARN）、`insertOrUpdateReactions:db:`、`saveOrUpdateStreams:db:` 失败只 WARN、不回滚；是否整条回滚需权衡（回滚会丢弃已成功的主消息行）。
+  4. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。
+  5. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
+  6. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
+  7. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
+  8. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

@@ -140,9 +140,13 @@ static WKRobotDB *_instance;
             JSONObjectWithData:[menusJSON dataUsingEncoding:NSUTF8StringEncoding]
                        options:NSJSONReadingAllowFragments
                          error:&err];
-        if(!err) {
+        // menus 必须是 JSON 数组；NSNull/字典/数字做快速枚举会崩（Round 40）
+        if(!err && [menusDicts isKindOfClass:[NSArray class]]) {
             NSMutableArray *menus = [NSMutableArray array];
             for (NSDictionary *menusDict in menusDicts) {
+                if(![menusDict isKindOfClass:[NSDictionary class]]) {
+                    continue;
+                }
                 WKRobotMenus *m = [self toRobotMenus:menusDict];
                 m.robotID = robot.robotID;
                 [menus addObject:m];

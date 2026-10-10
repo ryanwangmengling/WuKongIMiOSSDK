@@ -103,7 +103,8 @@ static WKMOSContentConvertManager *_instance;
                     JSONObjectWithData:[contentJsonStr dataUsingEncoding:NSUTF8StringEncoding]
                                options:0
                                  error:nil];
-                if(dic) {
+                // 仅接受 JSON 对象，数组/NSNull 上取下标会崩（Round 40）
+                if([dic isKindOfClass:[NSDictionary class]]) {
                     NSMutableDictionary *replyDic = [NSMutableDictionary dictionary];
                     replyDic[@"message_id"] = dic[@"quoteMsgNo"];
                     replyDic[@"from_uid"] = dic[@"quoteUserId"];
@@ -226,7 +227,15 @@ static WKMOSContentConvertManager *_instance;
             break;
         case 41:  { // 朋友圈消息
             NSString *contentStr = contentDic[@"content"];
-            NSDictionary *dictionary = [NSJSONSerialization JSONObjectWithData:[contentStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:nil];
+            // content 可能为 NULL（[nil dataUsingEncoding:] 得到 nil，JSONObjectWithData: 会抛异常），
+            // 且必须确保解析结果是 JSON 对象（Round 40）
+            NSDictionary *dictionary = nil;
+            if([contentStr isKindOfClass:[NSString class]] && contentStr.length>0) {
+                id parsed = [NSJSONSerialization JSONObjectWithData:[contentStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:nil];
+                if([parsed isKindOfClass:[NSDictionary class]]) {
+                    dictionary = parsed;
+                }
+            }
             if(dictionary) {
                 NSString *action = dictionary[@"comment_or_like"];
                 contentDic[@"cmd"] = @"momentMsg";

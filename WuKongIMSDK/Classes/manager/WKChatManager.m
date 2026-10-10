@@ -1540,6 +1540,12 @@
          NSLog(@"消息内容非JSON格式！");
         return nil;
     }
+    // JSONObjectWithData: 对 JSON 数组/NSNull 不报错，返回的是 NSArray/NSNull，直接取 objectForKey: 会抛
+    // NSInvalidArgumentException（远端可构造该 payload），必须校验为 NSDictionary（Round 40）
+    if(![contentDict isKindOfClass:[NSDictionary class]]) {
+        NSLog(@"WARN: 消息内容非 JSON 对象，跳过解码！class:%@",NSStringFromClass([contentDict class]));
+        return nil;
+    }
      NSNumber *actContentType = [contentDict objectForKey:@"type"];
     WKMessageContent *messageContent;
     if(!contentType) {

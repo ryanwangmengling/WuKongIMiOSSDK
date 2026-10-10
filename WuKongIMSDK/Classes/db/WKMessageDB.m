@@ -1091,7 +1091,8 @@ static WKMessageDB *_instance;
         __autoreleasing NSError *error = nil;
         NSDictionary *contentDictionary = [NSJSONSerialization JSONObjectWithData:data options:kNilOptions error:&error];
         NSInteger contentType = 0;
-        if(contentDictionary && contentDictionary[@"type"]) {
+        // 仅当解析结果是 JSON 对象时才读 type；数组/NSNull 上取下标会崩（Round 40）
+        if(!error && [contentDictionary isKindOfClass:[NSDictionary class]] && contentDictionary[@"type"]) {
              contentType = [contentDictionary[@"type"] integerValue];
         }
         stream.content = [self decodeContent:contentType data:data db:db];

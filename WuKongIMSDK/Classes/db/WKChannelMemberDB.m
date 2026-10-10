@@ -379,7 +379,8 @@ static WKChannelMemberDB *_instance;
     if(extraStr && ![extraStr isEqualToString:@""]) {
         __autoreleasing NSError *error = nil;
         NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
-        if(!error) {
+        // extra 列若为非 JSON 对象（数组/NSNull），dictionaryWithDictionary: 会抛 NSInvalidArgumentException（Round 40，同 R34 WKChannelInfoDB.toChannelInfo:）
+        if(!error && [extraDictionary isKindOfClass:[NSDictionary class]]) {
             member.extra = [NSMutableDictionary dictionaryWithDictionary:extraDictionary];
         }
     }
