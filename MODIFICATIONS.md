@@ -609,7 +609,38 @@ Round 15.5 的顾虑是「`deleteMessage:` 会动 `WKConversationManager` 的内
 
 ---
 
+## Round 17 — 已读回执缓存正确性 + 任务监听者字典加锁（对应 Android 2585602 并发容器普查的收尾）（2026-10-09）
+
+### 17.1 背景
+Round 12 已对全 SDK 的惰性初始化 getter 做过一次并发普查（对应 Android 2585602），Round 15 覆盖了发送队列/重试定时器。本轮把「共享可变容器」和「NSTimer 创建线程」再全量扫了一遍（grep `@property NSMutable*`、`scheduledTimerWithTimeInterval`、`IN (` 拼接），确认剩余未加锁点只有两处：`WKReceiptManager.cacheDict` 与 `WKBaseTask.listenerDic`；其余容器（`WKSDK.messageContentDict`、`WKConnectionManager.tempPackets`、`WKTaskManager.taskDic`、`WKMemoryCache`、`WKChannelRequestQueue`、`WKChannelManager.cacheDict`/`channelReqeusts`）均已有锁，SQL `IN ()` 空列表在 R6 之后各处均已守卫。
+
+### 17.2 改动
+
+**`manager/WKReceiptManager.m`**（已读回执缓存，4 处）
+
+1. **provider 异步回调期间追加的新消息会被误删（已读回执丢失）**。`flush:`（原 :116）在锁内把当前缓存拷成 `tmpMessages` 后，在锁外调用 App 的 `messageReadedProvider`；回调里原来的 `removeCacheWithLength:channel len:flushCachedLen` 是「从当前集合移除最前面的 N 条」。若回调返回前 App 又 `addReceiptMessages:` 追加了新消息，被移除的是新消息，这批新消息永远不会再上报。改为 `removeCacheMessages:channel messages:tmpMessages`，**按对象身份精确移除本次实际上报的那批**，并在集合清空时 `removeObjectForKey:`。
+2. **`addReceiptMessages:` 无条件建空集合**。原实现即便没有任何可上报消息也会 `setObject:messagesSets forKey:channel`，`cacheDict` 键随频道数无上限增长、`flushLoop` 反复对空频道调 `flush:`。改为仅在 `messagesSets.count>0` 时写入（并补 `channel`/`messages` 空值早退）。
+3. **`flushLoop` 无锁遍历 `cacheDict.allKeys`**。与 `addReceiptMessages:` 写入并发时可能「枚举中变更」崩溃。改为先加锁取键快照再遍历。
+4. **`flushTimer` 可能在非主线程创建**。`setup` 在 `+shared` 的 `dispatch_once` 内执行，而 `+shared` 可能被 App 在任意线程首次访问；`scheduledTimerWithTimeInterval:` 依赖调用线程 runloop，非主线程（无 runloop）时定时器永不触发/创建失败。改为统一派发到主线程的 `setupFlushTimer` 创建，并做「已有有效定时器则不重复建」的幂等保护。
+
+**`manager/task/WKBaseTask.m`**
+
+5. **`listenerDic` 读写无锁**（`addListener:target:` / `removeListener:` / `listeners`）。`addListener:` 由 `WKTaskManager.add`（`manager/WKTaskManager.m:26`）与 `WKMediaManager.download:callback:`（`manager/WKMediaManager.m:138`）在调用线程执行；`removeListener:` 由监听回调内的 `WKTaskManager.remove:`（`WKTaskManager.m:86`）执行；而任务实现的 `update`（App 侧下载/上传子类在工作线程调用）会读 `listeners` → `allValues`，三者可能跨线程并发。新增 `listenerLock`（NSRecursiveLock），三个方法统一加锁，`listeners` 在锁内取快照后返回。
+
+### 17.3 判定「不需要移植 / 已有覆盖」
+- `e0779a9`/`5aaa5a1`（只把需要存储的消息 push 给 UI、不存储的不 push）：iOS 行为本就相反且注释明确 —— `manager/WKChatManager.m:610-613` 用 `commonMessages`（`filterNoCMDAndNoStreamMessages`）调 `callRecvMessagesDelegate:`，注释「不管存不存的消息都需要通知到delegate」。
+- `137813f`（channel member 优先读 `avatar_cache_key`）：iOS 全库 grep `avatarCacheKey`/`avatar_cache_key` 无命中，无对应点。
+- `38c916f`（getOrSyncHistoryMessages 上拉 start/end seq 互换）：iOS 是另一套 `pullMessages`/`calSync` 序号差检测（`manager/WKChatManager.m:896-1050`），语义不同。
+- `d005ce6`/`18d12c6`（Android `saveSyncChannelMSGs` 删冗余 `queryWithMsgIds`，避免大批量消息堆内两份 OOM）：iOS `calSyncForForce`（`manager/WKChatManager.m:1391-1454`）与 pull 链路没有「写库后再按 msgIds 重查一遍」的冗余，无对应。
+- `789faba`（附件消息 `updateContentAndRefresh` 未把 type 放进 content JSON）：iOS `WKMessageContent` 走自己的 encode 流程、`type` 另存于消息行，未确认有对应 bug。
+- `cd8d574`/`05a454b`/`6d92c78`（保存频道成员提速等纯性能提交）：未确认有明确 bug，暂不夹带。
+
+### 17.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r17 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，仅 Pods deployment target 既有告警，日志 `/tmp/wk_build_r17.log`）。本轮未新增文件，无需 `pod install`。
+
+---
+
 ## 待办（后续轮次）
-- Round 17 候选：`WKMessageDB.saveMessages:` 的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）；复核 `6d9d6ad` 之后剩余的数据库类提交。
+- Round 18 候选：`WKMessageDB.saveMessages:` 的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）；复核 `6d9d6ad` 之后剩余的数据库类提交。
 - `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
