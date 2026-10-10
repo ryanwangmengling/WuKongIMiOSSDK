@@ -691,7 +691,10 @@ static WKMessageDB *_instance;
 
 -(void) updateMessageContent:(NSData*)content status:(WKMessageStatus)status extra:(NSDictionary*)extra clientSeq:(uint32_t)clientSeq {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_UPDATE_MESSAGE,content?:@"",@(status),[self extraToStr:extra],@(clientSeq)];
+        // Round 34：写失败不再静默（否则多媒体上传成功后内容/状态未落库，重启后丢失 remoteUrl）
+        if(![db executeUpdate:SQL_MESSAGE_UPDATE_MESSAGE,content?:@"",@(status),[self extraToStr:extra],@(clientSeq)]) {
+            NSLog(@"WARN: 消息内容/状态更新失败 clientSeq:%u error:%@",clientSeq,db.lastErrorMessage);
+        }
     }];
 }
 
@@ -722,7 +725,10 @@ static WKMessageDB *_instance;
                 }
                 
             }
-            [db executeUpdate:SQL_MESSAGE_UPDATE_WITHACK,@(sendackPacket.messageId),@(sendackPacket.messageSeq),@(orderSeq),@(status),@(sendackPacket.reasonCode),@(sendackPacket.clientSeq)];
+            // Round 34：回执写失败不再静默（否则服务端已回执，本地状态却仍停留在发送中且无日志）
+            if(![db executeUpdate:SQL_MESSAGE_UPDATE_WITHACK,@(sendackPacket.messageId),@(sendackPacket.messageSeq),@(orderSeq),@(status),@(sendackPacket.reasonCode),@(sendackPacket.clientSeq)]) {
+                NSLog(@"WARN: 消息回执落库失败 clientSeq:%u messageId:%llu error:%@",sendackPacket.clientSeq,sendackPacket.messageId,db.lastErrorMessage);
+            }
             
         }
         
@@ -731,14 +737,20 @@ static WKMessageDB *_instance;
 
 -(void) updateMessageVoiceReaded:(BOOL)voiceReaded clientSeq:(uint32_t)clientSeq {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_UPDATE_VOICE_READED,@(voiceReaded?1:0),@(clientSeq)];
+        // Round 34：写失败不再静默
+        if(![db executeUpdate:SQL_MESSAGE_UPDATE_VOICE_READED,@(voiceReaded?1:0),@(clientSeq)]) {
+            NSLog(@"WARN: 消息语音已读状态更新失败 clientSeq:%u error:%@",clientSeq,db.lastErrorMessage);
+        }
     }];
 }
 
 
 -(void) updateMessageExtra:(NSDictionary*) extra clientSeq:(uint32_t)clientSeq {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_UPDATE_EXTRA,[self extraToStr:extra],@(clientSeq)];
+        // Round 34：写失败不再静默（否则本地扩展未落库，但上层仍收到消息更新通知）
+        if(![db executeUpdate:SQL_MESSAGE_UPDATE_EXTRA,[self extraToStr:extra],@(clientSeq)]) {
+            NSLog(@"WARN: 消息扩展更新失败 clientSeq:%u error:%@",clientSeq,db.lastErrorMessage);
+        }
     }];
 }
 
@@ -984,7 +996,11 @@ static WKMessageDB *_instance;
     NSString *extraStr = @"";
     if(extra) {
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:extra options:kNilOptions error:nil];
-        extraStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+        if(!jsonData) { // 序列化失败时 initWithData:nil 会返回 nil，绑定 NULL 会让 not null 列整行写库失败（Round 34）
+            NSLog(@"WARN: extra JSON 序列化失败，回退为空串 %@",NSStringFromClass([self class]));
+            return @"";
+        }
+        extraStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] ?: @"";
     }
     return extraStr;
 }

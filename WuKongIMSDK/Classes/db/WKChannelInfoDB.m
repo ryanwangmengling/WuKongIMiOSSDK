@@ -316,7 +316,11 @@ static WKChannelInfoDB *_instance;
     NSString *extraStr = @"";
     if(extra) {
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:extra options:kNilOptions error:nil];
-        extraStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+        if(!jsonData) { // 序列化失败时 initWithData:nil 会返回 nil，绑定 NULL 会让 not null 列整行写库失败（Round 34）
+            NSLog(@"WARN: extra JSON 序列化失败，回退为空串 %@",NSStringFromClass([self class]));
+            return @"";
+        }
+        extraStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] ?: @"";
     }
     return extraStr;
 }

@@ -161,7 +161,8 @@
                 }
             }
             NSData *jsonData = [NSJSONSerialization dataWithJSONObject:newParam options:kNilOptions error:nil];
-            paramStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+            // Round 34：序列化失败时 initWithData:nil 会返回 nil，不能把 nil 写入 cmd（param 列为 not null）
+            paramStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] ?: @"";
             cmdMessage.cmd =cmd;
             cmdMessage.param = paramStr;
             [cmdMessages addObject:cmdMessage];

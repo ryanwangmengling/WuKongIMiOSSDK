@@ -255,7 +255,11 @@ static WKReminderDB *_instance;
     NSString *dataStr = @"";
     if(data) {
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:data options:kNilOptions error:nil];
-        dataStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+        if(!jsonData) { // 序列化失败时 initWithData:nil 会返回 nil，绑定 NULL 会让 not null 列整行写库失败（Round 34）
+            NSLog(@"WARN: data JSON 序列化失败，回退为空串 %@",NSStringFromClass([self class]));
+            return @"";
+        }
+        dataStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] ?: @"";
     }
     return dataStr;
 }

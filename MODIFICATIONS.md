@@ -1081,10 +1081,56 @@ C. 让根因可观测：
 ### 33.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r33 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r33.log`。
 
+## Round 34 — JSON 序列化失败不得返回 nil（写库 NULL 违例根因）+ 消息内容/扩展/回执更新失败可观测（2026-10-10）
+
+### 34.1 背景
+- 承接 Round 33 发现的 `extraToStr:`/`dataToStr:` 在 JSON 序列化失败时返回 nil。根因不在调用点，而在 helper 自身：
+  ```objc
+  NSString *extraStr = @"";
+  if(extra) {
+      NSData *jsonData = [NSJSONSerialization dataWithJSONObject:extra options:kNilOptions error:nil];
+      extraStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding]; // jsonData==nil 时返回 nil，覆盖了默认 @""
+  }
+  return extraStr;
+  ```
+  `[NSJSONSerialization dataWithJSONObject:...]` 遇到非 JSON 类型（NSDate/NaN/自定义对象等）会返回 nil，随后 `[[NSString alloc] initWithData:nil ...]` 返回 **nil**，把初始的 `@""` 覆盖掉。该 nil 绑定到 `not null default ''` 的 text 列 → 绑定 NULL → 整行写库失败（且此前各版本静默忽略）。
+- 对比 Android：`WKMsg.getLocalMapExtraString()`（`wkim/src/main/java/com/xinbida/wukongim/entity/WKMsg.java`:201-208）以 `String extras = ""` 起手，仅在 `localExtraMap != null && !isEmpty()` 时用 `new JSONObject(map).toString()` 覆盖，**永不返回 null**；`WKConversationMsg.getLocalExtraString()`（`WKConversationMsg.java`:44）同理。iOS helper 本意相同，但 `initWithData:nil` 破坏了该保证。
+- 与 Round 33 的关系：R33 是在各调用点加 `?:@""` 治标；本轮在 helper 内部根治，覆盖所有（含尚未加兜底的）调用点。
+
+### 34.2 改动（8 个文件 / 12 处）
+一、根治 7 个 JSON→字符串 helper：序列化失败时不返回 nil，回退 `@""` 并打 WARN（`NSStringFromClass([self class])`）：
+  1. `db/WKMessageDB.m` `extraToStr:`（现 :996）——同时覆盖 message 表 `extra`（`:234` saveMessages / `:321` insertMessage 的绑定）。
+  2. `db/WKChannelInfoDB.m` `extraToStr:`（现 :315）——覆盖 channel_info `extra`（`:73`/`:86` SQL_CHANNEL_SAVE、`:95`/`:124` SQL_CHANNEL_UPDATE）。
+  3. `db/WKMessageExtraDB.m` `extraToStr:`（现 :139）——覆盖 message_extra `extra`（`:61`/`:88` 未加兜底的调用点）。
+  4. `db/WKConversationDB.m` `extraToStr:`（现 :355）——覆盖 conversation `extra`（含 R33 未收窄的 `:123` `insertConversation:db:`）。
+  5. `db/WKConversationExtraDB.m` `extraToStr:`（现 :67）。
+  6. `db/WKChannelMemberDB.m` `extraToStr:`（现 :403）。
+  7. `db/WKReminderDB.m` `dataToStr:`（现 :254）——`reminders.data`。
+  统一改法：
+  ```objc
+  if(!jsonData) { NSLog(@"WARN: extra JSON 序列化失败，回退为空串 %@",NSStringFromClass([self class])); return @""; }
+  extraStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] ?: @"";
+  ```
+二、同类站点：`manager/WKCMDManager.m`:164 `paramStr` 也以 `[[NSString alloc] initWithData:jsonData ...]` 覆盖了 `:152` 的 `@""`，补 `?: @""`（`cmdMessage.param` 最终写入 cmd 表 not null 列）。
+三、消息更新失败可观测（`db/WKMessageDB.m`，均为 void，保持签名最小侵入，仅加失败 WARN，不再静默）：
+  - `updateMessageContent:status:extra:clientSeq:`（现 :692）——多媒体上传成功后内容/状态落库失败原本无任何日志，重启后丢失 remoteUrl；
+  - `updateMessageWithSendackPackets:`（现 :720，逐条）——回执落库失败原本静默，服务端已回执但本地状态停在发送中；
+  - `updateMessageVoiceReaded:clientSeq:`（现 :737）；
+  - `updateMessageExtra:clientSeq:`（现 :746）。
+
+### 34.3 判定（Android 对照）
+- JSON→字符串 helper 的 UTF-8 解码理论上可能返回 nil，但 `jsonData` 来自 `NSJSONSerialization` 必为合法 UTF-8，故实际只在 `jsonData==nil` 时触发；为防御仍加 `?:@""`。
+- Android `WKMsg.getLocalMapExtraString()` 在 null/空 map 时返回 `""`，不返回 null；iOS 修复后行为对齐，且额外打一条 WARN。
+- 消息 update 的 void→WARN 不改变调用方语义（发送/通知流程不受影响），只补可观测性；未改 `WKMessageDB.h` 签名，避免波及 `WKMediaManager`/`WKChatManager` 调用点。
+- 未处理 `WKMOSContentConvertManager.m`:360 `contentJSONStr`（赋给 `contentDic[@"contentJson"]`，nil 等价于删除该 key，无 NULL 绑定问题）与 `WKRSAUtil.m` 的多处 `initWithData:`（结果为临时结构体/返回给调用方判空，非 DB 绑定）。
+
+### 34.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r34 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r34.log`。
+
 ---
 ## 待办（后续轮次）
-- Round 34 候选（按优先级）：
-  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage:` 忽略落库结果；`WKMessageDB` 其余 void update 路径 `:692-743` 失败处理）。
+- Round 35 候选（按优先级）：
+  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage:` 忽略落库结果；`WKMessageDB` 其余 void update：`updateMessageStatus:withClientSeq:`、`updateMessageMaxSeqWithMessageIDOrClientMsgNo:...` 等失败处理）。
   2. `WKConversationDB.insertConversation:db:`/`addOrUpdateConversation:` 及 `WKChannelMemberDB.deleteMembers:`/`WKConversationExtraDB.updateVersion:` 等单条写仍忽略失败，评估是否统一上报。
   3. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
   4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
