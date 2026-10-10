@@ -640,7 +640,51 @@ Round 12 已对全 SDK 的惰性初始化 getter 做过一次并发普查（对�
 
 ---
 
+## Round 18 — 不连续消息同步的边界消息定位 / 分页取值修复（对应 Android `47ea031`/`75d9dc8`）（2026-10-09）
+
+### 18.1 背景
+Android PR #24（`fix/db-stability-and-performance`）里的 `47ea031`「查看不连续消息未同步」与 `75d9dc8`「同步不连续未同步」修的是 `MsgDbManager.getMessages` 在 `pullMode==0` 分支忽略 `contain` 参数、以及 start/end seq 互换，导致「不连续消息」同步时取的边界不是相邻消息。
+
+iOS 的对应机制与 Android 不同：iOS 没有 `contain` 参数，而是由 `WKChatManager pullMessages:...`（`manager/WKChatManager.m:835`）先取本地一页消息，再用 `WKMessageDB getMessage:channel lessThanAndFirstMessageSeq:` / `moreThanAndFirstMessageSeq:`（实现 `db/WKMessageDB.m:600-622`，仅被 `WKChatManager.m:904`/`:906` 调用）取与基准 orderSeq **相邻**的一条有 messageSeq 的消息，比较两者 seq 差判断是否存在「不连续」，必要时调 `calSync:` 补同步。
+
+### 18.2 改动
+
+**`db/WKMessageDB.m`**（2 处）
+
+1. **`SQL_MESSAGE_WITH_LESS_THAN_ORDER_SEQ`（:125）**：`order by message.message_seq asc limit 1` → `desc limit 1`。原写法在 `where ... order_seq<?` 的结果里取 **messageSeq 最小**（频道最早）的一条；调用方需要的是与基准最接近（messageSeq 最大）的相邻消息。
+2. **`SQL_MESSAGE_WITH_MORE_THAN_ORDER_SEQ`（:128）**：`order by message.message_seq desc limit 1` → `asc limit 1`。同理，原写法取的是频道最新一条。
+
+判据 / 证据：
+- 调用方 `WKChatManager.m:903` 的注释明确写「查询小于 startOrderSeq 最近的一条有 messageSeq 的消息」，而两条 SQL 的 ORDER BY 方向与之相反。
+- 同文件里对称的已删除消息查询 `SQL_DELETED_MESSAGE_SEQ_WITH_MESSAGE_SEQ_LESS`（:135）用 `desc`、`..._MORE`（:137）用 `asc`（LESS→desc / MORE→asc 的「最近优先」约定），且 `WKChatManager calSync:`（:1328）的两个循环靠 `break on gap>1` 依赖该顺序 —— 反证这两条 message_seq 查询的 ORDER BY 写反。
+- `message_seq<>0` 的行满足 `order_seq = message_seq * WKOrderSeqFactor`（1000），两者单调一致，故按 message_seq 排序等同于按位置排序。
+- 影响：基准 `startOrderSeq` 非 1000 倍数（本地未 ack 消息的 order_seq = maxOrderSeq+1）时进 `WKChatManager.m:899` 的 else 分支取邻居；取到极端值后 `needSync` 恒为真，`calSync` 会以错误的 start/end 对整段历史发起无效补同步（最多递归 5 次 `maxExecCount`），浪费网络与写库。
+
+**`manager/WKChatManager.m`**（2 处）
+
+3. **「计算最后一页后是否还存在消息」的 Down 分支循环体（:1016）**：`realStartMessageSeq = newMessages[0].messageSeq;` → `newMessages[i].messageSeq;`。原写法循环体恒读 index 0，当本页最旧一条是本地未确认消息（messageSeq==0）时 `realStartMessageSeq` 恒为 0，而 `calSync:` 在 Down 模式对 `startMessageSeq==0` 直接 `return false`，「是否还有更早消息」的判断被整体跳过。Up 分支（:1006-1012）从 `count-1` 递减取最新非 0 seq，Down 应对称地自前往后取最旧非 0 seq。
+4. **`pullMessages` 内层循环的 `WKMessage *nextMessage;`（:957）** → `WKMessage *nextMessage = nil;`。下方 :964 有 `if(!nextMessage) break;`，i==count-1 时内层循环不执行；显式初始化消除未初始化读。
+
+### 18.3 判定「不移植 / 无对应 / 已有覆盖」
+- 索引 `5b69519`：iOS 已有 `WuKongIMSDK/Assets/Migrations/202604150900.sql`（Round 3 提交 `0f0a0b7` 引入，与 Android 内容一致）。
+- WAL `f193f42` / `1a48603`（WAL 部分）：iOS `db/WKDB.m:108-114` 已在 `[newQueue inDatabase:]` 内执行 `PRAGMA journal_mode=WAL`（executeQuery）+ `synchronous=NORMAL`。
+- 延迟关旧队列 `594ccb2`：iOS `WKDB.m:139-147` `closeOldQueueAsync:newQueue:` 已 dispatch_after 0.5s 关旧队列（R13）。
+- `bdc02e2`（SQLCipher 关连接后 cursor 消费崩）：iOS 全库无 `- (FMResultSet` 返回（所有查询都在 `inDatabase:`/`inTransaction:` 块内消费），无对应点。
+- `8ec8e49`（queryCount 空检查）：iOS `WKDB.m:597-605` 用 `while([set next])`，FMResultSet 为 nil 时安全。
+- `16f46f9`（DateUtils ThreadLocal 缓存）：iOS `WKMessageDB.m:1171-1176` 的 `wk_dateFormatter` 用 `threadDictionary` 缓存，线程安全。
+- `2e1f27c`（附件上传失败刷新 listener）：iOS `WKMediaManager.m:182-187` 失败分支已先 `message.status = WK_MESSAGE_FAIL;` 再 `updateMessageStatus:` / `callMessageUpdateDelegate:`，行为正确。
+- `aef4cb6`（无网络重连不消耗次数）：iOS 已由 R2/R14 覆盖 —— `WKConnectionManager.m:545-578` `onNetworkStatusChange:` 有网即 `reconnectCount = 0` 并 cancel backoff/getAddr；`:466-474` `backoffReconnect` 无网早退；`:290-298` `connectSocket` 无网 / forceDisconnect 早退。
+- `98c2b88`（收消息先验合法性再解码）：iOS 顺序本正确（`coder/proto/WKRecvPacket.m:62` 先比对 msgKey，`:66` 才 decryption，失败 return nil）。
+- `d1351d0`（优化连接卡 UI）：主体是 Android demo 的 `ConnectionTestActivity` + `WKConnection` 锁重构（ReentrantLock 公平性 / 超时锁），属平台专属架构调整。
+- 其余（`1a48603` 线程池扩容、`11af5e9`、`deaf7fb`、`c8483c4`、`7762914`/`fda3423`/`564727d`/`d742164`/`e108c79`/`99d0a8b`/`a735d9d`/`4f3e435`/`c038944`/`1ac36f5`/`a448c9f`/`d4d1dc8`/`d4be779`、`f25f6ce`/`8327844`/`5f67b27`）：为新功能 / Android 专属 / 已具备，逐条见本轮勘察。
+
+### 18.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r18 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，`WKMessageDB.m`/`WKChatManager.m` 无新增告警，仅 Pods deployment target 既有告警，日志 `/tmp/wk_build_r18.log`）。本轮未新增文件，无需 `pod install`。
+
+---
+
 ## 待办（后续轮次）
-- Round 18 候选：`WKMessageDB.saveMessages:` 的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）；复核 `6d9d6ad` 之后剩余的数据库类提交。
+- Round 19 候选：`WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
 - `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
+- `WKRetryManager` 重发链路在「已删除消息」上的行为复查（R16 后 `getMessageWithMessageId:` 对已删除消息返回 nil，需确认 :251/:393 的 nil 分支不会误判为「消息不存在」而丢弃重试）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

@@ -954,7 +954,7 @@
             if(currMessage.messageSeq == 0) {
                 continue;
             }
-            WKMessage *nextMessage;
+            WKMessage *nextMessage = nil; // 修复：显式初始化，避免内层循环未执行时读到未初始化值（下方有 if(!nextMessage) 判空）
             for (NSInteger j=i+1; j<newMessages.count; j++) {
                  nextMessage = newMessages[j];
                 if(nextMessage.messageSeq != 0 ){
@@ -1012,8 +1012,12 @@
                     }
                    
                 }else {
+                    // 修复：原实现循环体恒取 newMessages[0]，当本页最旧一条是本地未确认消息（messageSeq==0）时，
+                    // realStartMessageSeq 会一直是 0，calSync 在 Down 模式对 startMessageSeq==0 直接 return false，
+                    // “是否还存在更早消息”的判断被整体跳过（对应 Android 47ea031/75d9dc8 不连续消息同步）。
+                    // 与 Up 分支对称：Down 取“最旧的一条有效 messageSeq”，故自前往后取第一个非 0。
                     for (NSInteger i=0; i<newMessages.count; i++) {
-                        realStartMessageSeq = newMessages[0].messageSeq;
+                        realStartMessageSeq = newMessages[i].messageSeq;
                         if(realStartMessageSeq!=0) {
                             break;
                         }

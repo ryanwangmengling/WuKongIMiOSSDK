@@ -121,11 +121,15 @@
 // 获取指定偏移量的第一条消息
 #define SQL_MESSAGE_WITH_OFFSET [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where message.channel_id=? and message.channel_type=? and message.is_deleted=0 order by message.order_seq desc limit ?,1",SQL_EXTRA_COLS,TB_MESSAGE]
 
-// 获取小于指定orderSeq 有messageSeq的第一条消息
-#define SQL_MESSAGE_WITH_LESS_THAN_ORDER_SEQ [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where message.channel_id=? and message.channel_type=? and message.order_seq<? and message.message_seq<>0 order by message.message_seq asc limit 1",SQL_EXTRA_COLS,TB_MESSAGE]
+// 获取小于指定 orderSeq、有 messageSeq 且与该 orderSeq 最接近（messageSeq 最大）的一条消息
+// 修复：原 ORDER BY message_seq asc 返回的是频道内最早的（messageSeq 最小）消息，而调用方
+// WKChatManager pullMessages 需要的是与基准位置“相邻/最近”的那条消息；返回最早消息会让序号差判断失真，
+// 触发对整段历史的无效补同步（对应 Android 47ea031/75d9dc8：不连续消息同步的边界定位）。
+#define SQL_MESSAGE_WITH_LESS_THAN_ORDER_SEQ [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where message.channel_id=? and message.channel_type=? and message.order_seq<? and message.message_seq<>0 order by message.message_seq desc limit 1",SQL_EXTRA_COLS,TB_MESSAGE]
 
-// 获取大于指定orderSeq 有messageSeq的第一条消息
-#define SQL_MESSAGE_WITH_MORE_THAN_ORDER_SEQ [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where message.channel_id=? and message.channel_type=? and  message.order_seq>? and message.message_seq<>0 order by message.message_seq desc limit 1",SQL_EXTRA_COLS,TB_MESSAGE]
+// 获取大于指定 orderSeq、有 messageSeq 且与该 orderSeq 最接近（messageSeq 最小）的一条消息
+// 修复同上：原 ORDER BY message_seq desc 返回的是频道内最新的消息，应为“最近的上一条”。
+#define SQL_MESSAGE_WITH_MORE_THAN_ORDER_SEQ [NSString stringWithFormat:@"select message.*,%@ from %@ left join message_extra on message.message_id=message_extra.message_id where message.channel_id=? and message.channel_type=? and  message.order_seq>? and message.message_seq<>0 order by message.message_seq asc limit 1",SQL_EXTRA_COLS,TB_MESSAGE]
 
 // 查询message_seq区间内被删除的消息
 #define SQL_DELETED_MESSAGE_WITH_MESSAGE_SEQ [NSString stringWithFormat:@"select * from %@ where channel_id=? and channel_type=? and is_deleted = 1 and message_seq<>0 and  message_seq>? and message_seq<? order by message_seq asc",TB_MESSAGE]
