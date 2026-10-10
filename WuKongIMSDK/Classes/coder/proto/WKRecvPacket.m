@@ -64,7 +64,16 @@
          return nil;
      }
     NSString *payloadEnc = [[WKSecurityManager shared] decryption:[[NSString alloc] initWithData:packet.payload encoding:NSUTF8StringEncoding]];
-    packet.payload = [payloadEnc dataUsingEncoding:NSUTF8StringEncoding];
+    if(payloadEnc) {
+        packet.payload = [payloadEnc dataUsingEncoding:NSUTF8StringEncoding];
+    } else {
+        // 解密失败（服务端未按当前 AES 配置下发 / 负载非法）时 decryption: 返回 nil。
+        // 原实现直接赋值会让 packet.payload 变 nil，下游 WKChatManager.decodeContent:contentType:
+        // 把 nil 传给 NSJSONSerialization 会抛 NSInvalidArgumentException 崩溃（收包热路径）。
+        // 这里退化为空负载，让解码按「空内容」优雅失败。
+        NSLog(@"warn: 消息负载解密失败，按空内容处理 fromUid:%@ channelId:%@ clientMsgNo:%@",packet.fromUid?:@"",packet.channelId?:@"",packet.clientMsgNo?:@"");
+        packet.payload = [NSData data];
+    }
     
     return packet;
 }

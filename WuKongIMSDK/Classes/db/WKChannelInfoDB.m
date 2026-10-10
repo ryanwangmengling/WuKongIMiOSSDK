@@ -356,11 +356,16 @@ static WKChannelInfoDB *_instance;
     channelInfo.flame = [dict[@"flame"] boolValue];
     channelInfo.flameSecond = [dict[@"flame_second"] integerValue];
     
+    // 同 WKMessageExtraDB.toExtra:：extra 列空/非字符串/非 JSON 对象时跳过。
+    // 原实现仅判 !error，extraDictionary 可能为 nil/NSNull，dictionaryWithDictionary: 会抛
+    // NSInvalidArgumentException（-copyItems: dictionary argument is not an NSDictionary）。
     NSString *extraStr = dict[@"extra"];
-    __autoreleasing NSError *error = nil;
-    NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
-    if(!error) {
-        channelInfo.extra = [NSMutableDictionary dictionaryWithDictionary:extraDictionary];
+    if([extraStr isKindOfClass:[NSString class]] && extraStr.length>0) {
+        __autoreleasing NSError *error = nil;
+        NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
+        if(!error && [extraDictionary isKindOfClass:[NSDictionary class]]) {
+            channelInfo.extra = [NSMutableDictionary dictionaryWithDictionary:extraDictionary];
+        }
     }
     return channelInfo;
 }

@@ -1159,11 +1159,15 @@ static WKMessageDB *_instance;
     
     message.status = [dict[@"status"] integerValue];
     message.reasonCode = [dict[@"reason_code"] integerValue];
+    // extra 列若为 NULL / 非字符串 / 非 JSON 对象时直接跳过，避免 [extraStr dataUsingEncoding:]
+    // 收到 NSNull 或 JSONObjectWithData: 收到 nil 时抛 NSInvalidArgumentException（同 WKMessageExtraDB.toExtra:）
     NSString *extraStr = dict[@"extra"];
-    __autoreleasing NSError *error = nil;
-    NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
-    if(!error) {
-        message.extra = [NSMutableDictionary dictionaryWithDictionary:extraDictionary];
+    if([extraStr isKindOfClass:[NSString class]] && extraStr.length>0) {
+        __autoreleasing NSError *error = nil;
+        NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
+        if(!error && [extraDictionary isKindOfClass:[NSDictionary class]]) {
+            message.extra = [NSMutableDictionary dictionaryWithDictionary:extraDictionary];
+        }
     }
     return message;
 }

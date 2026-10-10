@@ -1514,6 +1514,10 @@
 }
 
 -(WKMessageContent*) decodeContent:(NSData*) contentData contentType:(NSNumber**)contentType{
+    if(!contentData || contentData.length == 0) {
+        NSLog(@"warn: 消息内容为空，跳过解码！");
+        return nil;
+    }
     NSError *error;
     NSDictionary *contentDict = [NSJSONSerialization JSONObjectWithData:contentData options:kNilOptions error:&error];
     if(error) {

@@ -405,11 +405,14 @@ static WKConversationDB *_instance;
     conversation.version = [dict[@"version"] longLongValue];
     conversation.mute = [dict[@"mute"] boolValue];
     conversation.stick = [dict[@"stick"] boolValue];
+    // 同 WKMessageExtraDB.toExtra:：extra 列空/非字符串/非 JSON 对象时跳过，避免 NSNull/nil 触发 NSInvalidArgumentException
     NSString *extraStr = dict[@"extra"];
-    __autoreleasing NSError *error = nil;
-    NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
-    if(!error) {
-        conversation.extra = extraDictionary;
+    if([extraStr isKindOfClass:[NSString class]] && extraStr.length>0) {
+        __autoreleasing NSError *error = nil;
+        NSDictionary *extraDictionary = [NSJSONSerialization JSONObjectWithData:[extraStr dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
+        if(!error && [extraDictionary isKindOfClass:[NSDictionary class]]) {
+            conversation.extra = extraDictionary;
+        }
     }
     conversation.remoteExtra.channel = conversation.channel;
     if(dict[@"keep_message_seq"]) {

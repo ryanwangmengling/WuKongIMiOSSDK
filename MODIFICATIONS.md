@@ -921,11 +921,34 @@ for (NSInteger i=0; i<channelIDs.count; i++) {
 ### 27.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r27 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r27.log`）。本轮未新增文件，无需 `pod install`。
 
+## Round 28 — 修复收包解密失败导致的 JSON 解析崩溃 + extra 字段解析空值防御（2026-10-11）
+
+### 28.1 背景
+- Round 28 先用 `git log --oneline` 全量对照 Android 仓库（HEAD `662a559`）与本文档：候选提交 `6a95caf`（insertOrReplaceExtra 空指针）、`6d9d6ad`（getDb 空指针）、`11af5e9`（丢库补表）、`202d1f6`（重发 null NPE）、`8ec8e49`（cursor NPE）、`2585602`（并发）**均已在本文档记录**，无新可移植项。本轮转为修 iOS 自有崩溃点。
+- **崩溃链（本轮主修复）**：服务端未按当前 AES 配置下发（负载非 base64 / 非法填充）时 `WKAESUtil.aesDecrypt:key:iv:`（`Classes/utils/WKAESUtil.m:35-47`）在 `CCCrypt` 非 `kCCSuccess` 时返回 nil → `WKSecurityManager.decryption:`（`Classes/manager/WKSecurityManager.m:81-83`）返回 nil → `WKRecvPacket.m` `decodeLM:header:`（:66-67）把 nil 直接赋给 `packet.payload` → 收包路径 `WKChatManager.m` `recvPacketsToMessages:`（:1488）调用 `decodeContent:contentType:`（:1516）→ `[NSJSONSerialization JSONObjectWithData:nil ...]` 抛 `NSInvalidArgumentException: data parameter is nil`，**整条收包热路径崩溃**。
+- 经验验证（`clang -fobjc-arc -framework Foundation` 小程序）：`JSONObjectWithData:nil` → `EXCEPTION NSInvalidArgumentException: data parameter is nil`；`[NSNull dataUsingEncoding:]` → `-[NSNull dataUsingEncoding:]: unrecognized selector`；`[NSMutableDictionary dictionaryWithDictionary:nil]` 不崩（空字典）；`dictionaryWithDictionary:[NSNull null]` → `-[NSDictionary initWithDictionary:copyItems:]: dictionary argument is not an NSDictionary`。
+- **同类未守卫点**：`WKMessageDB.m` `toMessage:`、`WKConversationDB.m` `toConversation:`、`WKChannelInfoDB.m` `toChannelInfo:` 对 `dict[@"extra"]` 直接 `dataUsingEncoding:` + JSON 解析，无 nil/NSNull 守卫；而 `WKMessageExtraDB.m:172/:181`、`WKChannelMemberDB.m:367`、`WKReminderDB.m:232` 均已守卫，行为不一致。
+
+### 28.2 改动（5 个文件）
+1. `WuKongIMSDK/Classes/coder/proto/WKRecvPacket.m`（`decodeLM:header:`）: 解密结果为 nil 时打 warn 日志（含 fromUid/channelId/clientMsgNo）并把 `packet.payload` 退化为 `[NSData data]`，不再把 nil 传给下游。
+2. `WuKongIMSDK/Classes/manager/WKChatManager.m`（`decodeContent:contentType:`）: 入口新增 `if(!contentData || contentData.length == 0){ NSLog(@"warn: 消息内容为空，跳过解码！"); return nil; }`（空数据原本也会因 JSON 解析失败返回 nil，行为等价，仅去掉崩溃面）。
+3. `WuKongIMSDK/Classes/db/WKMessageDB.m`（`toMessage:`）: extra 解析段加 `[extraStr isKindOfClass:[NSString class]] && extraStr.length>0` 与 `[extraDictionary isKindOfClass:[NSDictionary class]]` 守卫。
+4. `WuKongIMSDK/Classes/db/WKConversationDB.m`（`toConversation:`）: 同 3。
+5. `WuKongIMSDK/Classes/db/WKChannelInfoDB.m`（`toChannelInfo:`）: 同 3（原实现 `dictionaryWithDictionary:extraDictionary` 在 extraDictionary 为 NSNull 时会抛异常）。
+
+### 28.3 判定 / 附带结论
+- 表 `message`/`conversation`/`channel` 等的 `extra` 列 schema 均为 `text not null default ''`（`Assets/Migrations/201911270513.sql:72/:104/:16`），且 `SQL_EXTRA_COLS`（`WKMessageDB.m:35`）只 IFNULL 了 readed/readed_at/... 而**不 alias `message_extra.extra`**，故 DB 层 extra 当前实际不可为 NULL；第 3-5 项为**防御性加固**（与已守卫站点保持一致），主修复是第 1-2 项。
+- 未守卫但判定安全、本轮不改：`WKCMDManager.m:106`（`cmd.param` 列 `text not null default ''`，`Assets/Migrations/202011211232.sql:11`）；`WKMOSContentConvertManager.m:229`（`convertContentToLM:` 全库无调用者，死代码）。
+- 本轮修复为 iOS 自有缺陷，**无对应 Android commit**（Android 侧未发现同型解密/JSON 空值缺陷）。
+
+### 28.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r28 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**。本轮未新增文件，无需 `pod install`。
+
 ---
 ## 待办（后续轮次）
-- Round 28 候选（按优先级）：
-  1. `WKConnectionManager` 其余未受 `isDebug` 保护的低频/异常日志（:596/:615/:812/:1013/:1072）是否统一收敛。
+- Round 29 候选（按优先级）：
+  1. `WKConnectionManager` 其余未受 `isDebug` 保护的低频/异常日志（`Classes/manager/WKConnectionManager.m` :596/:615/:818/:1037）是否统一收敛。
   2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径的失败处理）。
-  3. 继续用 `git log --oneline` 对照 MODIFICATIONS.md 哈希，筛 Android 未移植的 db/连接稳定性提交（`65c6eec` 系列已收口，查其余 `ReminderDBManager`/`MsgReactionDBManager` 写路径）。
-  4. `WKReminderDB` 其余写路径（`insertOrUpdateReminders:` 等）的失败处理与批量写走查。
+  3. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
+  4. `WKReminderDB` 其余写路径（`addOrUpdates:` `insertOrUpdateReminders:` 等）的失败处理与批量写走查。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
