@@ -15,7 +15,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (WKMessageExtraDB *)shared;
 
 
--(void) addOrUpdateMessageExtras:(NSArray<WKMessageExtra*>*)messageExtras;
+// 批量入库消息扩展。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 39）
+-(BOOL) addOrUpdateMessageExtras:(NSArray<WKMessageExtra*>*)messageExtras;
 
 -(void) addOrUpdateMessageExtra:(WKMessageExtra*)messageExtra db:(FMDatabase*)db;
 

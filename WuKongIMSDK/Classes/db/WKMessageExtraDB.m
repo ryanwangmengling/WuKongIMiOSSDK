@@ -50,10 +50,16 @@ static WKMessageExtraDB *_instance;
     return _instance;
 }
 
--(void) addOrUpdateMessageExtras:(NSArray<WKMessageExtra*>*)messageExtras {
+// 批量入库消息扩展。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 39）
+-(BOOL) addOrUpdateMessageExtras:(NSArray<WKMessageExtra*>*)messageExtras {
     if(!messageExtras || messageExtras.count == 0) {
-        return;
+        return YES;
     }
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 消息扩展入库失败：数据库不可用，数量:%lu",(unsigned long)messageExtras.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKMessageExtra *messageExtra in messageExtras) {
             NSString *extraStr = @"";
@@ -64,10 +70,16 @@ static WKMessageExtraDB *_instance;
             if(messageExtra.readedAt) {
                 readedAt = [messageExtra.readedAt timeIntervalSince1970];
             }
-            [db executeUpdate:SQL_MESSAGE_EXTRA_INSERT_OR_UPDATE,@(messageExtra.messageID),@(messageExtra.messageSeq),messageExtra.channelID?:@"",@(messageExtra.channelType),@(messageExtra.readed),@(readedAt),@(messageExtra.readedCount),@(messageExtra.unreadCount),@(messageExtra.revoke),messageExtra.revoker?:@"",@(messageExtra.isPinned),messageExtra.contentEditData?:@"",@(messageExtra.editedAt),extraStr,@(messageExtra.extraVersion)];
+            if(![db executeUpdate:SQL_MESSAGE_EXTRA_INSERT_OR_UPDATE,@(messageExtra.messageID),@(messageExtra.messageSeq),messageExtra.channelID?:@"",@(messageExtra.channelType),@(messageExtra.readed),@(readedAt),@(messageExtra.readedCount),@(messageExtra.unreadCount),@(messageExtra.revoke),messageExtra.revoker?:@"",@(messageExtra.isPinned),messageExtra.contentEditData?:@"",@(messageExtra.editedAt),extraStr,@(messageExtra.extraVersion)]) {
+                success = NO;
+                NSLog(@"WARN: 消息扩展入库失败已回滚 messageID:%llu error:%@",messageExtra.messageID,db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
             
         }
     }];
+    return success;
 }
 
 -(WKMessageExtra*) getMessageExtraWithMessageID:(uint64_t)messageID {
@@ -91,12 +103,18 @@ static WKMessageExtraDB *_instance;
     if(messageExtra.readedAt) {
         readedAt = [messageExtra.readedAt timeIntervalSince1970];
     }
-    [db executeUpdate:SQL_MESSAGE_EXTRA_INSERT_OR_UPDATE,@(messageExtra.messageID),@(messageExtra.messageSeq),messageExtra.channelID?:@"",@(messageExtra.channelType),@(messageExtra.readed),@(readedAt),@(messageExtra.readedCount),@(messageExtra.unreadCount),@(messageExtra.revoke),messageExtra.revoker?:@"",@(messageExtra.isPinned),messageExtra.contentEditData?:@"",@(messageExtra.editedAt),extraStr,@(messageExtra.extraVersion)];
+    // Round 39：写失败不再静默（在调用方事务内，不能在此回滚，仅告警）
+    if(![db executeUpdate:SQL_MESSAGE_EXTRA_INSERT_OR_UPDATE,@(messageExtra.messageID),@(messageExtra.messageSeq),messageExtra.channelID?:@"",@(messageExtra.channelType),@(messageExtra.readed),@(readedAt),@(messageExtra.readedCount),@(messageExtra.unreadCount),@(messageExtra.revoke),messageExtra.revoker?:@"",@(messageExtra.isPinned),messageExtra.contentEditData?:@"",@(messageExtra.editedAt),extraStr,@(messageExtra.extraVersion)]) {
+        NSLog(@"WARN: 消息扩展入库失败 messageID:%llu error:%@",messageExtra.messageID,db.lastErrorMessage);
+    }
 }
 
 -(void) addOrUpdateContentEdit:(WKMessageExtra*)messageExtra {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_ADD_UPDATE_CONTENT_EDIT,@(messageExtra.messageID),@(messageExtra.messageSeq),messageExtra.channelID?:@"",@(messageExtra.channelType),messageExtra.contentEditData?:@"",@(messageExtra.editedAt),@(messageExtra.uploadStatus)];
+        // Round 39：写失败不再静默
+        if(![db executeUpdate:SQL_ADD_UPDATE_CONTENT_EDIT,@(messageExtra.messageID),@(messageExtra.messageSeq),messageExtra.channelID?:@"",@(messageExtra.channelType),messageExtra.contentEditData?:@"",@(messageExtra.editedAt),@(messageExtra.uploadStatus)]) {
+            NSLog(@"WARN: 正文编辑入库失败 messageID:%llu error:%@",messageExtra.messageID,db.lastErrorMessage);
+        }
     }];
 }
 
@@ -114,13 +132,19 @@ static WKMessageExtraDB *_instance;
 
 -(void) updateContentEditUploadStatusToFailStatus{
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_UPDATE_CONTENT_EDIT_UPLOADSTATUS_WITH_UPLOADSTATUS,@(WKContentEditUploadStatusError),@(WKContentEditUploadStatusWait)];
+        // Round 39：写失败不再静默
+        if(![db executeUpdate:SQL_UPDATE_CONTENT_EDIT_UPLOADSTATUS_WITH_UPLOADSTATUS,@(WKContentEditUploadStatusError),@(WKContentEditUploadStatusWait)]) {
+            NSLog(@"WARN: 正文编辑上传状态批量置失败失败 error:%@",db.lastErrorMessage);
+        }
     }];
 }
 
 -(void) updateUploadStatus:(WKContentEditUploadStatus)status withMessageID:(uint64_t)messageID {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_UPDATE_UPLOADSTATUS_WITH_MESSAGEID,@(status),@(messageID)];
+        // Round 39：写失败不再静默
+        if(![db executeUpdate:SQL_UPDATE_UPLOADSTATUS_WITH_MESSAGEID,@(status),@(messageID)]) {
+            NSLog(@"WARN: 正文编辑上传状态更新失败 messageID:%llu status:%ld error:%@",messageID,(long)status,db.lastErrorMessage);
+        }
     }];
 }
 

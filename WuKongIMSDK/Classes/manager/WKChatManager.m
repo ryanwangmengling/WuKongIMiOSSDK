@@ -1595,7 +1595,11 @@
             return;
         }
        
-        [[WKMessageExtraDB shared] addOrUpdateMessageExtras:@[message.remoteExtra]];
+        // Round 39：扩展未落库则不再通知 UI，避免上层展示未持久化的状态
+        if(![[WKMessageExtraDB shared] addOrUpdateMessageExtras:@[message.remoteExtra]]) {
+            NSLog(@"WARN: 更新远程消息扩展失败：扩展未落库，跳过消息更新通知 messageId:%llu",message.messageId);
+            return;
+        }
         [weakSelf callMessageUpdateDelegate:message];
         
         if(message.remoteExtra.isMutualDeleted) { // 如果是双向删除 则删除此消息
@@ -1889,7 +1893,14 @@
                 for (WKMessageExtra *messageExtra in results) {
                     [messageIDs addObject:@(messageExtra.messageID)];
                 }
-                [[WKMessageExtraDB shared] addOrUpdateMessageExtras:results];
+                // Round 39：整批扩展未落库则中止本次同步并回调错误，避免按未持久化的版本无限翻页
+                if(![[WKMessageExtraDB shared] addOrUpdateMessageExtras:results]) {
+                    NSLog(@"WARN: 同步消息扩展落库失败，已中止本次同步 messageIds:%@",messageIDs);
+                    if(complete) {
+                        complete([NSError errorWithDomain:@"消息扩展落库失败" code:0 userInfo:nil]);
+                    }
+                    return;
+                }
                 NSArray<WKMessage*> *messages = [[WKMessageDB shared] getMessagesWithMessageIDs:messageIDs];
                 if(messages && messages.count>0) {
                     NSDictionary *reactionDict=  [[WKReactionDB shared] getReactionDictionary:messageIDs];

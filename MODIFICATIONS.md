@@ -1277,12 +1277,50 @@ C. 让根因可观测：
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r38 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r38.log`。本轮未新增文件，无需 `pod install`。
 
 ---
+## Round 39 — 消息扩展批量入库失败整批回滚 + 单条写失败不再静默（2026-10-14）
+
+### 39.1 背景
+- 承接 R32–R38「失败不得谎报成功 / 失败必须可观测」主线，本轮对象是 `WKMessageExtraDB`（消息扩展表 `message_extra`，与主消息表分离）。
+- `addOrUpdateMessageExtras:`（`db/WKMessageExtraDB.m`:53-71）在 `dbQueue inTransaction:` 内逐条 `executeUpdate`，但**既不接返回值、也从不置 `*rollback = YES`**：批次中途任一条失败时，前面已写的行会照常提交、后面行被跳过，方法返回 `void` 且无任何日志，上层（`WKChatManager`）无从得知，产生部分落库。
+- 其余单条写同样丢弃 `executeUpdate`：`addOrUpdateMessageExtra:db:`、`addOrUpdateContentEdit:`、`updateContentEditUploadStatusToFailStatus`、`updateUploadStatus:withMessageID:`。正文编辑（content edit）上传状态若写失败，`WKRetryManager` 的重试队列将与 DB 状态不一致。
+- 另补 R37 遗漏：`WKMessageDB.deleteMessage:`（`db/WKMessageDB.m`:789-795）按 `clientSeq` 单条删除仍丢弃返回值（R37 只覆盖了批量 `deleteMessagesWithClientSeqs:`）。
+
+### 39.2 Android 对照
+- **无直接对标（iOS 架构差异）**：Android 把消息扩展作为 `message` 表的一列 `message_extra`（`WKDBColumns.messageExtra = "message_extra"`），随消息行原子写入，没有 iOS 这种独立 `message_extra` 表的批量事务，故不存在「批次部分提交」。Android 对应逻辑是 `MsgDbManager.insertOrReplaceExtra(extraList)`（由 `MsgManager.saveRemoteExtraMsg` 调用，`MsgManager.java`:842）。
+- 本轮「失败回滚 + 返回布尔」的语义与 R33 的 Android `insertOrUpdate` 返回 boolean 风格一致；Android 无对应 commit。
+
+### 39.3 改动（4 个文件）
+一、`db/WKMessageExtraDB.h`
+- `addOrUpdateMessageExtras:`（:18）返回类型 `void` → `BOOL`，注释「返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO」。
+二、`db/WKMessageExtraDB.m`
+- `addOrUpdateMessageExtras:`（:53-76）：空数组返回 YES；`dbQueue == nil` 时 WARN + 返回 NO；新增 `__block BOOL success = YES;`；逐条 `if(![db executeUpdate:...]) { success = NO; WARN; *rollback = YES; return; }`；末尾 `return success;`（WARN: 消息扩展入库失败已回滚 messageID:%llu error:%@）。
+- `addOrUpdateMessageExtra:db:`（:85-102）：`if(![db executeUpdate:...])` 打 `WARN: 消息扩展入库失败 messageID:%llu error:%@`（在调用方事务内执行，不在此回滚，仅告警）。
+- `addOrUpdateContentEdit:`（:104-111）：失败打 `WARN: 正文编辑入库失败 messageID:%llu error:%@`。
+- `updateContentEditUploadStatusToFailStatus`（:124-130）：失败打 `WARN: 正文编辑上传状态批量置失败失败 error:%@`。
+- `updateUploadStatus:withMessageID:`（:132-138）：失败打 `WARN: 正文编辑上传状态更新失败 messageID:%llu status:%ld error:%@`。
+三、`manager/WKChatManager.m`
+- `updateMessageRemoteExtra:`（:1598 起）：接住 BOOL；失败打 `WARN: 更新远程消息扩展失败：扩展未落库，跳过消息更新通知 messageId:%llu` 并 `return`（不再 `callMessageUpdateDelegate:`、不再因 `isMutualDeleted` 删消息），避免上层展示/删除未持久化的状态。
+- `syncMessageExtra:complete:maxReqCount:`（:1892 起）：接住 BOOL；失败打 `WARN: 同步消息扩展落库失败，已中止本次同步 messageIds:%@`，`complete(error)` 并 `return` —— 避免按「未被推进的 `maxExtraVersion`」无限翻页（原实现失败后仍会因 `results.count >= limit` 递归同步同一页）。
+四、`db/WKMessageDB.m`
+- `deleteMessage:`（:789-795，按 `clientSeq` 单条删除，R37 遗漏）：失败打 `WARN: 删除消息失败 clientSeq:%u error:%@`。
+
+### 39.4 判定
+- 批量方法选 `BOOL + *rollback`（而非仅 WARN）：与 R33 `WKConversationExtraDB.addOrUpdates:` / `WKChannelMemberDB.addOrUpdateMembers:` 既有模式一致，保证「要么整批成功、要么整批不落库」。
+- `addOrUpdateMessageExtra:db:` 在调用方（`WKMessageDB.insertMessage`/`replaceMessages` 的事务）内执行，**不置 rollback**：消息主行已成功写入，若因扩展失败回滚整个事务会连消息一起丢弃，代价更大（扩展可由后续 `syncMessageExtra` 补回），故只告警。
+- `addOrUpdateContentEdit:` / `updateUploadStatus:` 仍保持 `void`：调用方（`WKChatManager.editMessage:`、`WKRetryManager`）拿到失败也无补偿动作，下层 WARN 已可观测；不引入无意义 API 扩张（同 R37 判定）。
+- `syncMessageExtra` 失败改为回调 error + return：宁可让上层稍后重试，也不在 DB 未推进时无限递归。
+
+### 39.5 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r39 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r39.log`。本轮未新增文件，无需 `pod install`。
+
+---
 ## 待办（后续轮次）
-- Round 39 候选（按优先级）：
-  1. 继续「单条写失败可观测」扫尾：`WKChannelMemberDB.deleteMembers:`、`WKConversationExtraDB.updateVersion:`、以及 `WKChannelInfoDB`/`WKReminderDB`/`WKPinnedMessageDB`/`WKCMDDB`/`WKRobotDB`/`WKMessageExtraDB`/`WKDB.m` 等约 30 处语句式 `executeUpdate` 仍丢弃返回值（可批量加 WARN，注意避免刷屏）。
-  2. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。
-  3. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
-  4. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
-  5. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
-  6. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口。
+- Round 40 候选（按优先级）：
+  1. 继续「单条写失败可观测」扫尾（按优先级）：`WKChannelInfoDB`（:73/:86 `SQL_CHANNEL_SAVE`、:95/:124 `SQL_CHANNEL_UPDATE`、:106/:108 在线状态）、`WKPinnedMessageDB`（:81/:87/:97）、`WKReminderDB`（:144/:150/:168）、`WKConversationExtraDB.updateVersion:`（:40）、`WKChannelMemberDB.deleteMembers:`（:163）/`updateMemberStatus...`（:305）、`WKCMDDB`（:100/:123）、`WKRobotDB`（:107）、`WKMessageExtraDB` 剩余、`WKDB.m`（:113 `PRAGMA` / :187 `DELETE FROM schema_migrations` 可忽略）。
+  2. 跨表事务「部分提交」面：`WKMessageDB.saveMessages:`/`replaceMessages:` 内 `addOrUpdateMessageExtra:db:`（R39 已加 WARN）、`insertOrUpdateReactions:db:`、`saveOrUpdateStreams:db:` 失败只 WARN、不回滚；是否整条回滚需权衡（回滚会丢弃已成功的主消息行）。
+  3. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。
+  4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
+  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
+  6. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
+  7. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

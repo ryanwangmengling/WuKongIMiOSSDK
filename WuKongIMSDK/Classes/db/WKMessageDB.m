@@ -790,7 +790,10 @@ static WKMessageDB *_instance;
     
     uint32_t clientSeq = message.clientSeq;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_DELETE_CLIENT_SEQ,@(clientSeq)];
+        // Round 39：补 R37 遗漏的单条删除失败告警
+        if(![db executeUpdate:SQL_MESSAGE_DELETE_CLIENT_SEQ,@(clientSeq)]) {
+            NSLog(@"WARN: 删除消息失败 clientSeq:%u error:%@",clientSeq,db.lastErrorMessage);
+        }
     }];
 }
 
