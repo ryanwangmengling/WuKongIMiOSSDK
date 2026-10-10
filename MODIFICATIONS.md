@@ -1127,12 +1127,37 @@ C. 让根因可观测：
 ### 34.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r34 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r34.log`。
 
+## Round 35 — 编辑正文/提醒项上传重试次数耗尽不再静默（对齐 `retrySend` 的 ed969a1 修法）（2026-10-11）
+
+### 35.1 背景
+- 上游 iOS 提交 `ed969a1`（2024-07-04，*fix: maxed the retry count without the delegate callback*）修的是消息发送重试：`retrySend` 原来把「超过重试次数」分支**嵌在内层 `if` 里**（`if(item && retryCount<max){ if(retryCount<max){ ... } }`），导致该分支永远不可达——次数耗尽后消息既不标失败也不回调上层。
+- 同一结构在另两条定时重试路径**仍然存在**，两者都只有「未超限则重试」的分支，**没有 `else`**：
+  - `manager/WKRetryManager.m contentEditRetryUpload`（改前 :360-385）：`if(item && item.retryCount<contentEditRetryCount){ if(item.retryCount<contentEditRetryCount){ if(...){ ... item.retryCount++; ... [self uploadContentEdit:item.messageExtra]; } } }`；
+  - `manager/WKRetryManager.m reminderUpload`（改前 :336-358）：`if(item && item.retryCount<reminderRetryCount){ if(...){ ... item.retryCount++; ... [self uploadReminder:item.reminder]; } }`。
+- 后果：次数耗尽后 item **永久留在** `messageExtraRetryDict`/`reminderRetryDict`，每个定时器 tick 空转却不再做任何事——既不标记上传失败，也不通知上层，`removeMessageExtraRetryItem:`/`removeReminderRetryItem:` 永不调用。
+- 量化（默认值，`WKOptions.m:23-28`：`contentEditRetryInterval=10`/`contentEditRetryCount=8`、`reminderRetryInterval=10`/`reminderRetryCount=20`）：定时器周期为 `interval/2`（:283/:316）即 **5s**，8 次在 **40s** 就耗尽重试计数；而 `startMessageExtraRetry` 的时间窗是 `editedAt + 10*8 = 80s`（:270）——即 **后半段 40s 完全不再尝试上传**。提醒项更糟：`startReminderRetry`（:303-333）没有时间窗分支，只在 start 时靠 `updateExpireDoneUploadStatusFail:`（:305）按龄批量置失败，运行期耗尽后不会有任何失败状态写入。
+
+### 35.2 改动（1 个文件 / 2 处）
+`manager/WKRetryManager.m`：
+1. `reminderUpload`（现 :336-363）：显式 `if(!item) continue;`，并把超限分支补成 `else`——`[self removeReminderRetryItem:key]` + `[[WKReminderDB shared] updateUploadStatus:WKReminderUploadStatusError reminderID:@(item.reminder.reminderID)]` + `NSLog(@"WARN: 提醒项上传重试次数已耗尽，标记为上传失败 reminderID:%lld key:%@", ...)`。
+2. `contentEditRetryUpload`（现 :365-397）：删去重复的嵌套 `if(item.retryCount<contentEditRetryCount)` 判断，显式 `if(!item) continue;`，超限分支补成 `else`——`[self removeMessageExtraRetryItem:key]` + `[[WKMessageExtraDB shared] updateUploadStatus:WKContentEditUploadStatusError withMessageID:item.messageExtra.messageID]` + `WARN` 日志 + `getMessageWithMessageId:` 后 `[[WKSDK shared].chatManager callMessageUpdateDelegate:message]`（与 `startMessageExtraRetry` 超时分支 :273-278 完全一致）。
+
+### 35.3 判定（Android 对照 / 不移植说明）
+- **无对应 Android commit**：Android 仓库全量 grep `retryCount|contentEditRetry|reminderRetry|maxRetry` 只有 `ConnectionClient.java:88-95` 的连接超时 `MAX_TIMEOUT_RETRIES`，没有编辑正文/提醒项的重试实现（Android 侧不重试这两类上传）。故本轮是 iOS 自身 bug 修复，非移植。
+- 修法刻意对齐 iOS 自身 `retrySend`（`ed969a1`）的既有语义：**超限 → 移出重试队列 + 标记失败 + 通知上层**，避免为两条路径发明第三套行为。
+- 提醒项未新增 delegate 回调：`WKReminderManagerDelegate` 只有 `reminderManager:didChange:reminders:`（`WKReminderManager.h:22-29`，语义是某频道提醒列表变化），而上传状态「只对本地生效」（`WKReminder.h:41`）；现有 `uploadReminder` 出错路径（:404-405）也只写 DB 不回调，故本轮只补 `WARN` 使其可观测，保持一致。
+- 未改 `WKRetryManager.h` 方法签名；`addMessageExtra:`/`addReminder:` 的 `retryCount=0` 初值不变。
+
+### 35.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r35 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r35.log`。
+
 ---
 ## 待办（后续轮次）
-- Round 35 候选（按优先级）：
-  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage:` 忽略落库结果；`WKMessageDB` 其余 void update：`updateMessageStatus:withClientSeq:`、`updateMessageMaxSeqWithMessageIDOrClientMsgNo:...` 等失败处理）。
-  2. `WKConversationDB.insertConversation:db:`/`addOrUpdateConversation:` 及 `WKChannelMemberDB.deleteMembers:`/`WKConversationExtraDB.updateVersion:` 等单条写仍忽略失败，评估是否统一上报。
-  3. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
+- Round 36 候选（按优先级）：
+  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage:...` 忽略 `WKMessageDB` 落库结果；`WKMessageDB` 其余 void update：`updateMessageStatus:withClientSeq:`、`deleteMessagesWithClientSeqs:`、`destoryMessage:` 等失败处理）。
+  2. `WKConversationManager.addOrUpdateConversation:incUnreadCount:` 返回的 `WKConversationAddOrUpdateResult` 被 `WKChatManager.addOrUpdateConversationWithMessages:`（:719-733）完全忽略，单条会话写失败仍通知 UI。
+  3. `WKConversationDB.insertConversation:db:`/`updateConversation:db:`、`WKChannelMemberDB.deleteMembers:`、`WKConversationExtraDB.updateVersion:` 等单条写仍忽略 `executeUpdate` 失败，评估是否统一上报。
   4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
   5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
+  6. Android 未移植提交继续扫描——本轮已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽（PR #24 索引已 R3 移植；PR #25/#26 是 Android 关闭 DB 竞态，iOS 无 DB 关闭路径；9d07754 是 rawQuery→select，iOS 已用占位符绑定）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

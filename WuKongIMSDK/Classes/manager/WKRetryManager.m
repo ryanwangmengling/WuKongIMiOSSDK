@@ -343,8 +343,9 @@ static WKRetryManager *_instance;
         WKRetryItem *item =  self.reminderRetryDict[key];
         [self.retryLock unlock];
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if(!item) continue;
         // 如果重试次数小于目标重试次数并且满足重试时间，则重试
-        if(item && item.retryCount<[WKSDK shared].options.reminderRetryCount) {
+        if(item.retryCount<[WKSDK shared].options.reminderRetryCount) {
             if((now - item.nextRetryTime)>=0) {
                 if([WKSDK shared].isDebug) {
                     NSLog(@"重试上传提醒项  key:[%@] retryCount: [%ld] nextRetryTime: [%ld]",key,item.retryCount,item.nextRetryTime);
@@ -353,6 +354,10 @@ static WKRetryManager *_instance;
                 item.nextRetryTime =now+[WKSDK shared].options.reminderRetryInterval;
                 [self uploadReminder:item.reminder];
             }
+        }else { // 超过重试次数 提醒项上传状态设置为失败并移出重试队列（对齐 retrySend 的 ed969a1 修法）
+            [self removeReminderRetryItem:key];
+            [[WKReminderDB shared] updateUploadStatus:WKReminderUploadStatusError reminderID:@(item.reminder.reminderID)];
+            NSLog(@"WARN: 提醒项上传重试次数已耗尽，标记为上传失败 reminderID:%lld key:%@",(long long)item.reminder.reminderID,key);
         }
     }
 }
@@ -368,17 +373,24 @@ static WKRetryManager *_instance;
         [self.retryLock unlock];
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         
+        if(!item) continue;
         // 如果重试次数小于目标重试次数并且满足重试时间，则重试
-        if(item && item.retryCount<[WKSDK shared].options.contentEditRetryCount) {
-            if(item.retryCount<[WKSDK shared].options.contentEditRetryCount ) {
-                if((now - item.nextRetryTime)>=0) {
-                    if([WKSDK shared].isDebug) {
-                        NSLog(@"重试上传编辑正文  key:[%@] retryCount: [%ld] nextRetryTime: [%ld]",key,item.retryCount,item.nextRetryTime);
-                    }
-                    item.retryCount++;
-                    item.nextRetryTime =now+[WKSDK shared].options.contentEditRetryInterval;
-                    [self uploadContentEdit:item.messageExtra];
+        if(item.retryCount<[WKSDK shared].options.contentEditRetryCount) {
+            if((now - item.nextRetryTime)>=0) {
+                if([WKSDK shared].isDebug) {
+                    NSLog(@"重试上传编辑正文  key:[%@] retryCount: [%ld] nextRetryTime: [%ld]",key,item.retryCount,item.nextRetryTime);
                 }
+                item.retryCount++;
+                item.nextRetryTime =now+[WKSDK shared].options.contentEditRetryInterval;
+                [self uploadContentEdit:item.messageExtra];
+            }
+        }else { // 超过重试次数 编辑正文上传状态设置为失败、移出重试队列并通知上层（对齐 retrySend 的 ed969a1 修法）
+            [self removeMessageExtraRetryItem:key];
+            [[WKMessageExtraDB shared] updateUploadStatus:WKContentEditUploadStatusError withMessageID:item.messageExtra.messageID];
+            NSLog(@"WARN: 编辑正文上传重试次数已耗尽，标记为上传失败 messageID:%llu key:%@",item.messageExtra.messageID,key);
+            WKMessage *message = [[WKMessageDB shared] getMessageWithMessageId:item.messageExtra.messageID];
+            if(message) {
+                [[WKSDK shared].chatManager callMessageUpdateDelegate:message];
             }
         }
     }
