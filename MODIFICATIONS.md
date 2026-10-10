@@ -709,10 +709,40 @@ iOS 的对应机制与 Android 不同：iOS 没有 `contain` 参数，而是由 
 ### 19.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r19 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r19.log`）。本轮未新增文件，无需 `pod install`。
 
+## Round 20 — 最近会话插入的 extra/version 参数错位修复 + 频道ID占位符绑定（iOS 自有缺陷）（2026-10-09）
+
+### 20.1 背景
+`db/WKConversationDB.m` 的 `insertConversation:db:` 与 `replaceConversations:` 共用同一张 `conversation` 表和相同的列清单 `(..., unread_count, extra, version, is_deleted)`，但两处 FMDB 位置参数顺序不一致：`replaceConversations:`（:99）为 `...@(unreadCount), extraStr, @(version), @(isDeleted)`（正确）；`insertConversation:db:`（:114）写成了 `...@(unreadCount), @(version), extraStr, @(isDeleted)`，把 `version` 数值绑进 `extra` 列、把 `extra` JSON 字符串绑进 `version` 列。
+
+新建会话的所有路径都走 `insertConversation:`：`WKConversationManager addOrUpdateConversation:incUnreadCount:` 在会话不存在时于 :67 调用它（收到/发送某频道第一条消息、同步到新会话都会命中）；`WKConversationManager addConversation:`（:89）→ `WKConversationDB addConversation:`（:106）也落到它。只有「会话已存在」才走 `updateConversation:db:`（`SQL_UPDATE_LASTMSG` 不含 extra/version），所以该错位对每个新会话必然发生一次。
+
+读回路径 `toConversation:`（`version` :407 走 `longLongValue`，`extra` :408-410 当 JSON 字符串解析）在错位后会出问题：`version` 列存的是 extra 的 JSON（空串或对象文本，`longLongValue` 得 0）→ 会话版本丢失 → `getConversationMaxVersion`（`SQL_MAX_VERSION`）拿到偏小值 → 触发不必要的最近会话全量同步；`extra` 列存的是纯数字文本（如 `0`），`NSJSONSerialization` 把 `0` 解析成 `NSNumber` 并赋给 `WKConversation.extra`（声明为 `NSDictionary*`），类型错位，后续 `conversation.extra[...]` 下标访问有崩溃风险。
+
+Android 无对应提交：`ConversationDbManager` 用 `ContentValues` 按列名写入（`getInsertSyncCV`/`insertSyncMsg`），不存在位置参数错位。本轮记为「iOS 自有缺陷」。
+
+### 20.2 改动
+**`db/WKConversationDB.m`**（2 处）
+
+1. **`insertConversation:db:`（:114）参数顺序修正（本轮主修）**：改为 `...@(conversation.unreadCount), extraStr, @(conversation.version), @(conversation.isDeleted)`，与列清单及 `replaceConversations:` 一致。修复后新插入会话的 `extra`/`version` 各归其位。
+2. **`getConversations:`（:259-298）改占位符绑定**：原实现把每个 `channelId` 直接拼进 `IN (...)` 的引号中（`[NSString stringWithFormat:@"%@'%@'",...]`，原 :268-276），含单引号的频道ID会生成非法 SQL（并构成注入面）。现按 channel 数量生成 `?,?,...` 占位符、用 `[... executeQuery:... withArgumentsInArray:channelIDs]` 绑定（绑定顺序即 `IN` 列表顺序）。空列表由 :260 早退保护，无需担心生成 `IN ()`。
+
+### 20.3 判定「不移植 / 无对应」
+- 本轮主修为 iOS 自有缺陷，Android 用具名列写入，无位置参数错位，无对应 commit。
+- 复查 `SQL_MAX_VERSION`（:50）的 `where version <> ''`：`version` 列具数值 affinity，`''` 被折叠为 0，等价于排除 version=0 的会话，属既有意图，非 bug，不动。
+- 其余同类 `IN (...)` 拼接处绑定的是数值ID（clientSeq/messageID/reminderID 等），无字符串引号问题：`WKMessageDB.m:466/501/520/782/802/938`、`WKReminderDB.m:130/165`、`WKChannelMemberDB.m:267/285`、`WKCMDDB.m:123`、`WKReactionDB.m:59`，本轮不一并改动。
+- 另注意到 `WKRobotDB.m:52/71` 把 robotID/username 包成双引号（`"%@"`）拼进 `IN (...)`：SQLite 会把双引号优先当标识符、无匹配列时才当字符串字面量（double-quoted string literal 旧行为），同样存在特殊字符破坏 SQL 的风险，但属另一文件、需评估 SQLite 编译选项，留作后续轮次候选。
+
+### 20.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r20 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r20.log`）。本轮未新增文件，无需 `pod install`。
+
 ---
 
 ## 待办（后续轮次）
-- Round 20 候选：`WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的 OOM/性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）；`WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
+- Round 21 候选（按优先级）：
+  1. `WKRobotDB.m:52/71` 的 `IN ("robotID"/"username")` 双引号拼接改为占位符绑定（与 R20 同类加固；需确认无需兼容 SQLite 的 double-quoted string literal 行为）。
+  2. `WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）。
+  3. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
+  4. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
 - `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
 - `WKRetryManager` 重发链路在「已删除消息」上的行为复查（R16 后 `getMessageWithMessageId:` 对已删除消息返回 nil，需确认 :251/:393 的 nil 分支不会误判为「消息不存在」而丢弃重试）。
 - 全库其余「提前 return 不回调 complete」的 API 契约普查（本轮已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。

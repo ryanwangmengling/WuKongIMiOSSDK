@@ -111,7 +111,7 @@ static WKConversationDB *_instance;
     NSString *extraStr = [self extraToStr:conversation.extra];
     NSString *parentChannelID  = conversation.parentChannel?conversation.parentChannel.channelId:@"";
     uint8_t parentChannelType = conversation.parentChannel?conversation.parentChannel.channelType:0;
-    [db executeUpdate:SQL_INSERT,conversation.channel.channelId,@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),@(conversation.version),extraStr,@(conversation.isDeleted)];
+    [db executeUpdate:SQL_INSERT,conversation.channel.channelId,@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
 }
 
 -(void) clearConversationUnreadCount:(WKChannel*)channel {
@@ -260,23 +260,17 @@ static WKConversationDB *_instance;
     if(!channels||channels.count == 0) {
         return nil;
     }
-    NSMutableArray *channelIDs = [NSMutableArray array];
+    NSMutableArray<NSString*> *channelIDs = [NSMutableArray array];
+    NSMutableArray<NSString*> *placeholders = [NSMutableArray array];
     for (WKChannel *channel in channels) {
-        [channelIDs addObject:channel.channelId];
+        [channelIDs addObject:channel.channelId?:@""];
+        [placeholders addObject:@"?"];
     }
-    NSString *inquery = @"";
-    for (NSInteger i=0; i<channelIDs.count; i++) {
-        NSString *channelID = channelIDs[i];
-        if(i == channels.count-1) {
-            inquery = [NSString stringWithFormat:@"%@'%@'",inquery,channelID];
-        }else {
-            inquery = [NSString stringWithFormat:@"%@'%@',",inquery,channelID];
-        }
-        
-    }
+    // 使用占位符绑定频道ID（原实现直接把 channelId 拼进 IN (...) 的引号中，含单引号的频道ID会生成非法SQL）
+    NSString *inquery = [placeholders componentsJoinedByString:@","];
     __block NSMutableArray<WKConversation*> *conversations = [NSMutableArray array];
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        FMResultSet *resultSet =  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_GET_WITH_CHANNELS,inquery]];
+        FMResultSet *resultSet =  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_GET_WITH_CHANNELS,inquery] withArgumentsInArray:channelIDs];
         while (resultSet.next) {
             WKConversation *conversation = [self toConversation:resultSet.resultDictionary];
             BOOL exist = false;
