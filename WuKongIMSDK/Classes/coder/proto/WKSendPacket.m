@@ -40,8 +40,14 @@
     
     NSString *payloadStr = [[NSString alloc] initWithData:packet.payload encoding:NSUTF8StringEncoding];
     NSString *payloadEnc = [[WKSecurityManager shared] encryption:payloadStr];
-    
-    packet.payload = [payloadEnc dataUsingEncoding:NSUTF8StringEncoding];
+    if(payloadEnc && [payloadEnc dataUsingEncoding:NSUTF8StringEncoding]) {
+        packet.payload = [payloadEnc dataUsingEncoding:NSUTF8StringEncoding];
+    } else {
+        // 加密失败（key 未协商成功 / payload 非 UTF-8）时不能把 payload 置为 nil：
+        // 后续 writeData:nil 会触发 NSInvalidArgumentException 崩溃（Round 31）。
+        NSLog(@"warn: WKSendPacket payload 加密失败，将以空 payload 编码 clientMsgNo:%@",packet.clientMsgNo?:@"");
+        packet.payload = [NSData data];
+    }
     
     
     // 消息序列号(客户端维护)

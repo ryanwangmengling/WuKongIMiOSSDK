@@ -41,6 +41,11 @@ NS_ASSUME_NONNULL_BEGIN
  */
 -(NSString*) decryption:(NSString*)data;
 
+/**
+ AES key 是否已就绪（DH 协商成功且长度合法）
+ */
+-(BOOL) isAesKeyReady;
+
 - (NSString *)md5:(NSString *)input;
 
 @end

@@ -37,6 +37,12 @@
     }
     // 编码body
     NSData *bodyBytes =  [[[WKSDK shared].bodyCoderManager getBodyCoder:packet.header.packetType] encode:packet];
+    if(!bodyBytes) {
+        // 未注册的 packetType 会让 getBodyCoder: 返回 nil，bodyBytes 为 nil 时
+        // appendData:nil 会崩溃；这里退化为空 body 并告警（Round 31）。
+        NSLog(@"warn: WKCoder 未找到 packetType=%d 的 body 编码器，按空 body 编码",packet.header.packetType);
+        bodyBytes = [NSData data];
+    }
     // 编码剩余长度并组合
     [bufferData appendData:[self encodeLength:(u_int32_t)bodyBytes.length]];
     // 组合body

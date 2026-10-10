@@ -50,6 +50,11 @@
 }
 
 -(void) writeData:(NSData*) data {
+    // 防御：appendData:nil 会抛 NSInvalidArgumentException。消息 payload 可能为 nil
+    //（content 为空 / 加密失败返回 nil），这里安全跳过而不是崩溃（Round 31）。
+    if(!data || data.length == 0) {
+        return;
+    }
     [self.buffData appendData:data];
 }
 
@@ -64,6 +69,9 @@
     
 }
 -(void) pushBufferData:(NSData*)tmpData{
+    if(!tmpData || tmpData.length == 0) {
+        return;
+    }
     if(self.isLittleEndian) {
         for (int i=0; i<tmpData.length; i++) {
              [self.buffData appendData:[tmpData subdataWithRange:NSMakeRange(i, 1)]];

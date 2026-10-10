@@ -21,6 +21,13 @@
     if (!sourceStr) {
         return nil;
     }
+    // key 为空时 [key getCString:] 是向 nil 发消息(no-op)，keyPtr 仍是 bzero 后的全零缓冲区，
+    // CCCrypt 会用「全零 AES key」成功加密 —— 密文服务端解不开却没有任何报错。
+    // 这里直接失败并告警，避免静默产生错误密文（对应 Android CryptoUtils 加密失败返回 null）。
+    if (!key || key.length == 0) {
+        NSLog(@"warn: WKAESUtil aesEncrypt 失败：AES key 为空（密钥未协商成功？）");
+        return nil;
+    }
     
     NSData *data = [sourceStr dataUsingEncoding:NSUTF8StringEncoding];
     
@@ -34,6 +41,10 @@
  
 + (NSString *)aesDecrypt:(NSString *)secretStr key:(NSString*)key iv:(NSString*)iv{
     if (!secretStr) {
+        return nil;
+    }
+    if (!key || key.length == 0) {
+        NSLog(@"warn: WKAESUtil aesDecrypt 失败：AES key 为空（密钥未协商成功？）");
         return nil;
     }
     //先对加密的字符串进行base64解码
@@ -58,6 +69,12 @@
  *
  */
 + (NSData *)AES128operation:(CCOperation)operation data:(NSData *)data key:(NSString *)key iv:(NSString *)iv {
+    // 双保险：全零 key 会被 CCCrypt 当作合法参数；data 为 nil（如 base64 解码失败）也不能交给 CCCrypt。
+    if (!key || key.length == 0 || !data) {
+        NSLog(@"warn: WKAESUtil AES128operation 参数为空(key 长度:%lu)，跳过",
+              (unsigned long)key.length);
+        return nil;
+    }
     
     char keyPtr[kCCKeySizeAES128 + 1];  //kCCKeySizeAES128是加密位数 可以替换成256位的
     bzero(keyPtr, sizeof(keyPtr));

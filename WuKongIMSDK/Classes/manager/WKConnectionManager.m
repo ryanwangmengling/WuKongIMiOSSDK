@@ -1004,6 +1004,10 @@ static dispatch_queue_t _imsocketQueue;
 -(void) handleConnected:(WKConnackPacket*)connackPacket{
     
     [[WKSecurityManager shared] generateAesKey:connackPacket.serverKey salt:connackPacket.salt];
+    if(![[WKSecurityManager shared] isAesKeyReady]) {
+        // serverKey/salt 非法导致密钥协商失败：连接仍会建立，但此后发送的消息无法加密（Round 31）。
+        NSLog(@"warn: 连接已建立但 AES 密钥未就绪（serverKey/salt 非法或 DH 协商失败），发送的消息将无法加密");
+    }
    
     // 重连次数归0
     self.reconnectCount = 0;

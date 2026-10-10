@@ -102,6 +102,10 @@ static WKSecurityManager *_instance;
     return output;
 }
 
+-(BOOL) isAesKeyReady {
+    return self.aesKey.length > 0;
+}
+
 -(NSString*) encryption:(NSString*)data {
     return [WKAESUtil aesEncrypt:data key:self.aesKey iv:self.aesIV];
 }

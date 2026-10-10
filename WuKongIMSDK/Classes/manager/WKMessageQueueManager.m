@@ -160,6 +160,10 @@ static WKMessageQueueManager *_instance;
     NSMutableData *sendPacketDatas = [[NSMutableData alloc] init];
     for (WKSendPacket *sendPacket in batch) {
         NSData *data = [[WKSDK shared].coder encode:sendPacket];
+        if(!data) { // 编码失败时 appendData:nil 会崩溃，跳过该包（Round 31）
+            NSLog(@"warn: WKMessageQueueManager 编码发送包失败，已跳过 clientMsgNo:%@",sendPacket.clientMsgNo?:@"");
+            continue;
+        }
         [sendPacketDatas appendData:data];
     }
     if(sendPacketDatas.length>0) {

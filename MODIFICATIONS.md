@@ -992,11 +992,45 @@ C. 读侧一致性：`WKReactionDB.m:123-124`（emoji/createdAt）、`WKChannelM
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r30 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r30.log`。
 
 ---
+
+## Round 31 — 加密失败不再静默：AES key 空值守卫 + nil payload 编码崩溃防护（2026-10-11）
+
+### 31.1 背景
+- 承接 Round 29 遗留（本文档 30.3 与待办 #5）：`WKSecurityManager.generateAesKey:salt:` 协商失败时把 `aesKey` 清为 nil（R29 有意），但 `WKConnectionManager.handleConnected:`（:1004-1006）不检查结果就 `changeConnectStatus:WKConnected`；连接状态一变即启动发送队列（`[WKMessageQueueManager.shared start]`，:740）。
+- 静默 bug 链：`WKSendPacket.encodeLM:`（:42）取 `[[WKSecurityManager shared] encryption:payloadStr]` → `WKAESUtil.aesEncrypt:key:iv:` → `AES128operation:` 里 `[key getCString:keyPtr ...]`（:64）与 `[iv getCString:ivPtr ...]`（:68）**对 nil 是 no-op**，keyPtr/ivPtr 仍是 bzero 后的全零缓冲区 → CCCrypt 用「16 字节全零 AES key + 全零 IV」成功返回密文。即密钥未协商成功时消息仍被「成功」加密，服务端无法解开且本地无任何告警（Android `CryptoUtils` 加密失败返回 null，parity gap）。
+- 同一路径的第二处崩溃：`aesEncrypt` 对 nil key 返回 nil 后，`WKSendPacket.encodeLM:` 原第 :44 行 `packet.payload=[payloadEnc dataUsingEncoding:]` 在 `payloadEnc` 为 nil 时把 payload 置 nil，随后 :69 `[writer writeData:packet.payload]` → `WKDataWrite.writeData:`（`WKData.m`:52-54）`[self.buffData appendData:nil]` 抛 NSInvalidArgumentException。
+- 同类 nil-append 风险点：`WKCoder.encodeLM:`（`WKCoder.m`:43）在 packetType 未注册（`getBodyCoder:` 返回 nil）时 `appendData:bodyBytes`；`WKMessageQueueManager.flushQueue:`（:162-164）在 coder encode 返回 nil 时 `appendData:data`。（`WKConnectionManager.writeData:` :703-713 已有 nil 守卫，无需改。）
+
+### 31.2 改动（8 个文件 / 11 处）
+A. 空 key 守卫（不再静默产生错误密文）：
+1. `WuKongIMSDK/Classes/utils/WKAESUtil.m` `aesEncrypt:key:iv:`（:20 起，NSLog :28）加 `if(!key || key.length==0)` 直接 return nil 并打 `warn: WKAESUtil aesEncrypt 失败：AES key 为空（密钥未协商成功？）`。
+2. 同文件 `aesDecrypt:key:iv:`（:35 起，NSLog :47）加同款空 key 守卫与告警。
+3. 同文件 `AES128operation:data:key:iv:`（:60 起，NSLog :74）在函数入口加 `if(!key || key.length==0 || !data) return nil`（双保险，含 `initWithBase64EncodedString:` 解码失败 data 为 nil 的情形）。
+B. nil payload / nil 编码结果防护（不再崩溃）：
+4. `WuKongIMSDK/Classes/coder/WKData.m` `writeData:`（:52-59）入口加 `if(!data || data.length==0) return;`，`pushBufferData:`（:71-73）加 `if(!tmpData || tmpData.length==0) return;`。
+5. `WuKongIMSDK/Classes/coder/proto/WKSendPacket.m` `encodeLM:`（:43-50）改用 `if(payloadEnc && [payloadEnc dataUsingEncoding:NSUTF8StringEncoding])` 分支赋值；失败时打 `warn: WKSendPacket payload 加密失败，将以空 payload 编码 clientMsgNo:%@` 并 `packet.payload=[NSData data]`。
+6. `WuKongIMSDK/Classes/coder/WKCoder.m` `encodeLM:`（:41-45）bodyBytes 为 nil（packetType 无编码器）时打 `warn: WKCoder 未找到 packetType=%d 的 body 编码器，按空 body 编码` 并退化为 `[NSData data]`。
+7. `WuKongIMSDK/Classes/manager/WKMessageQueueManager.m` `flushQueue:`（:161-166）encode 返回 nil 时打 `warn: WKMessageQueueManager 编码发送包失败，已跳过 clientMsgNo:%@` 并 `continue`。
+C. 让根因可观测：
+8. `WuKongIMSDK/Classes/manager/WKSecurityManager.h`（:44-47）新增 `-(BOOL) isAesKeyReady;`；`.m`（:105-107）实现 `return self.aesKey.length > 0;`。
+9. `WuKongIMSDK/Classes/manager/WKConnectionManager.m` `handleConnected:`（:1006-1010）在 `generateAesKey:salt:` 之后判断 `isAesKeyReady`，未就绪则打 `warn: 连接已建立但 AES 密钥未就绪（serverKey/salt 非法或 DH 协商失败），发送的消息将无法加密`。
+对应 Android 提交：`98c2b88`/`25caa7a` 的「加密失败返回 null」防护思路（Android `CryptoUtils.aesEncrypt` 返回 null、调用方判空），iOS 此前只做了 decrypt 侧（R28）。
+
+### 31.3 判定
+- 不改「协商失败仍允许连接」的降级策略（与 Android 一致：连接可用于收包/重连，发送会失败）；只把静默错误密文改为显式失败 + 告警，避免服务端收到永远解不开的消息。
+- 空 key 时 `aesEncrypt` 现在返回 nil，因此 B 项 4-7 的 nil 防护是本轮 A 项的必要配套（否则把「静默错误密文」换成「崩溃」）。
+- `aesDecrypt` 全零 key 本就会 CCCrypt 失败返回 nil，R28 已在 `WKRecvPacket` 兜底为空 payload；本轮加守卫只为提前告警，行为不变。
+- 排除项：Android `137813f`（member 头像缓存 key）— iOS `WKChannelMember`（`WKChannelMemberDB.h`:26-49）无该属性、`toMemberModel:` 也不读该列，不移植；`38c916f`/`6d92c78`/`cd8d574`/`05a454b`/`dc2b1a9` 均为 Android 专属结构或已被 iOS 等价实现覆盖。
+
+### 31.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r31 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0；本轮 7 个源文件无新增告警（唯一的 `WKConnectionManager.m:1130` retain-cycle 警告为既有的、不在改动区域内），日志 `/tmp/wk_build_r31.log`。
+
+---
 ## 待办（后续轮次）
-- Round 31 候选（按优先级）：
-  1. `WKConnectionManager` 4 处未受 `isDebug` 保护的 NSLog 经复核为异常/错误路径、保留；改排查是否有 payload/敏感信息在非 isDebug 路径被打印。
-  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径失败处理）。
-  3. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
-  4. `WKReactionDB.insertOrUpdateReactions:` 返回 true 无视 executeUpdate 失败，评估是否应聚合失败并返回 NO（需查调用方）。
-  5. 复核 `WKAESUtil` 在 nil key/iv 时用全零 key 静默降级，是否应改为显式拒绝发送（待评估）。
+- Round 32 候选（按优先级）：
+  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径失败处理）。
+  2. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
+  3. `WKReactionDB.insertOrUpdateReactions:` 返回 true 无视 executeUpdate 失败，评估是否应聚合失败并返回 NO（需查调用方）。
+  4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30 已复核 :596/:615/:818/:1037 为异常路径、保留）。
+  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（本轮 B 项 6 已改为不崩溃，错包应由服务端/上层重试处理）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
