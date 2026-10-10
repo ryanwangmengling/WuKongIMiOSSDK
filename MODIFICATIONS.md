@@ -782,12 +782,40 @@ Android 无对应 commit：Android 侧无 `updateChannelSetting`/`ChannelSetting
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r22 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r22.log`）。本轮未新增文件，无需 `pod install`。
 - Insert SQL 列/参数一致性普查（承接 R20）：`SQL_CHANNEL_SAVE`（`WKChannelInfoDB.m:12`，27 列）实参 :73/:86、`SQL_CHANNEL_UPDATE`（:14）实参 :95、`SQL_MEMBER_ADD`/`SQL_MEMBER_UPDATE_OR_ADD`（`WKChannelMemberDB.m:13/18`）实参 :142、`SQL_MESSAGE_EXTRA_INSERT_OR_UPDATE`（`WKMessageExtraDB.m:11`，15 列）实参 :67/:94、`SQL_ADD_UPDATE`(reminders)（`WKReminderDB.m:12`，12 列）实参 :64、`SQL_INSERT_REACTIONS`（`WKReactionDB.m:15`）实参 :93/:102 —— 列清单与实参逐条比对均一致，无第二处参数错位。
 
+## Round 23 — 收包解码越界防御：WKDataRead 全员长度校验 + decodeLM 包体长度校验（iOS 自有加固）（2026-10-09）
+
+### 23.1 背景
+`coder/WKData.m` 的 `WKDataRead` 所有读取方法（`readUint8/16/32/64`、`readint64`、`readData:`、`readString`、`readLenth`、`lenthLength`）都直接用 `subdataWithRange:NSMakeRange(offset, len)`，**没有任何长度校验**；`coder/WKCoder.m` 的 `decodeLM:`（:45-73）读出 `remainingLength` 后也未校验实际可用 body 长度。
+连接层的分包逻辑（`manager/WKConnectionManager.m` 的 `splitPacketData`）只校验「固定头 + 长度字节 + 声明的剩余长度 ≤ TCP 缓冲」，因此**声明的 remLength 与真实 body 内容可以不一致**（服务器 bug、中间设备改包、协议版本不匹配、或 App 直接调用公开 API `WKCoder.decode:`）。一旦 body 按字段读越界（例如 WK_RECV 包声明 remLength=1，`readString` 却要先读 2 字节长度），就会抛 `NSRangeException` 直接崩溃。
+对应 Android 25caa7a「修改收到信息先验证合法性再解码内容」的防御意图；但该提交本身是带字面冲突标记（`<<<<<<< HEAD`）的 merge commit，属 Android 专用 payload 解码，**无法直接移植**，本轮按其「先验证合法性再解码」的思路在 iOS 侧独立加固。
+
+### 23.2 改动
+`coder/WKData.m`：
+- 新增私有 `-(NSUInteger) unreadLength`（剩余可读字节，offset 越界返回 0）与 `-(BOOL) canRead:(NSUInteger)len`；
+- `readUint8/readUint16/readUint32/readUint64/readint64`：读取前 `canRead:` 校验，不足则打日志、返回 0 且**不推进 offset**；
+- `readData:`：`len<=0` 或越界返回空 `NSData`（不再 `subdataWithRange:` 崩溃）；
+- `readString`：长度字段越界或内容越界返回 `@""`；
+- `readLenth`：每步 `canRead:1`，越界 break；
+- `lenthLength`：循环内新增 `i` 的边界检查（原实现直接读 `buffData[i]`）；
+- `remainingData`：offset 越界时返回空 `NSData`。
+
+`coder/WKCoder.m`：`decodeLM:` 读出 `remainingLength` 后，用 `reader.remainingData.length` 校验；声明长度大于实际可用字节数时打日志并 `return nil`（上层 `WKConnectionManager handlePacketData:` :896 已有 `if(!packet) continue;`，会安全跳过该包）。
+
+### 23.3 判定不移植 / 附带结论
+- Android `25caa7a`：带冲突标记的 merge commit，不可 cherry-pick；本轮仅沿用其防御意图。
+- `WKDataRead.lenthLength` 在 iOS 全库无调用方（仅头文件声明 + 实现），但仍加了边界检查，避免后续被误用时崩溃。
+- 正常合法包路径完全不变（所有校验只在越界时触发日志与默认值），不会影响协议兼容。
+
+### 23.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r23 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，`WKData.m`/`WKCoder.m` 无新增告警，日志 `/tmp/wk_build_r23.log`）。本轮未新增文件，无需 `pod install`。
+
 ---
 ## 待办（后续轮次）
-- Round 23 候选（按优先级）：
-  1. `WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）。
-  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
-  3. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
-  4. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
-  5. `WKMediaManager` 的 `delegates`（NSHashTable）从未赋值、`addDelegate:`/`removeDelegate:` 为 no-op（R22 勘察发现，属死代码；确认无调用方后清理或补全 getter）。
+- Round 24 候选（按优先级）：
+  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
+  2. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查。
+  3. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue`/`WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager`）。
+  4. `WKMediaManager` 的 `delegates`（NSHashTable）从未赋值、`addDelegate:`/`removeDelegate:` 为 no-op（R22 勘察发现，属死代码；确认无调用方后清理或补全 getter）。
+  5. `WKDataWrite.encodeLength:`（`coder/WKCoder.m:67-78`）对 `length==0` 返回空数据（缺少长度前缀），核查是否存在零长度 body 的包会踩中。
+  6. `WKConnectionManager.handlePacketData:` 内多条未受 `isDebug` 保护的 `NSLog`（:893/:897/:900 等）在热路径上，评估收敛为 `isDebug` 保护。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

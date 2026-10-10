@@ -50,6 +50,14 @@
         return [WKPongPacket new];
     }
    uint32_t remainingLength =  [reader readLenth];
+    // 校验包体长度：声明的剩余长度不能超过实际可用字节数，否则后续按字段读取会越界崩溃。
+    // 对应 Android 25caa7a「先验证合法性再解码内容」的防御思路（该提交本身是带冲突标记的
+    // merge commit，无法直接 cherry-pick，此处按其防御意图在 iOS 侧加固）。
+    NSData *remainBody = [reader remainingData];
+    if(remainBody.length < remainingLength) {
+        NSLog(@"WKDecoder: 包体长度不合法，声明剩余长度:%u 实际可用:%lu", remainingLength, (unsigned long)remainBody.length);
+        return nil;
+    }
     
     WKHeader *header = [WKHeader new];
     header.remainLength = remainingLength;

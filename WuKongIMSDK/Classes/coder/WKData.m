@@ -103,58 +103,103 @@
     return self;
 }
 
+-(NSUInteger) unreadLength {
+    if(!self.buffData || self.offset < 0 || (NSUInteger)self.offset >= self.buffData.length) {
+        return 0;
+    }
+    return self.buffData.length - (NSUInteger)self.offset;
+}
+
+-(BOOL) canRead:(NSUInteger)len {
+    return len <= [self unreadLength];
+}
+
 -(uint8_t) readUint8 {
-    uint8_t v;
-     [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 1)] bytes] count:1];
-     self.offset+=1;
+    uint8_t v = 0;
+    if(![self canRead:1]) {
+        NSLog(@"WKDataRead: readUint8 越界（offset=%d, length=%lu）", self.offset, (unsigned long)self.buffData.length);
+        return 0;
+    }
+    [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 1)] bytes] count:1];
+    self.offset+=1;
     return v;
 }
 
 -(uint16_t) readUint16 {
-    uint16_t v;
-     [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 2)] bytes] count:2];
+    uint16_t v = 0;
+    if(![self canRead:2]) {
+        NSLog(@"WKDataRead: readUint16 越界（offset=%d, length=%lu）", self.offset, (unsigned long)self.buffData.length);
+        return 0;
+    }
+    [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 2)] bytes] count:2];
     self.offset+=2;
     return v;
 }
 
 -(uint32_t) readUint32 {
-    uint32_t v;
-     [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 4)] bytes] count:4];
+    uint32_t v = 0;
+    if(![self canRead:4]) {
+        NSLog(@"WKDataRead: readUint32 越界（offset=%d, length=%lu）", self.offset, (unsigned long)self.buffData.length);
+        return 0;
+    }
+    [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 4)] bytes] count:4];
     self.offset+=4;
     return v;
 }
 
 -(uint64_t) readUint64 {
-    uint64_t v;
+    uint64_t v = 0;
+    if(![self canRead:8]) {
+        NSLog(@"WKDataRead: readUint64 越界（offset=%d, length=%lu）", self.offset, (unsigned long)self.buffData.length);
+        return 0;
+    }
     [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 8)] bytes] count:8];
     self.offset+=8;
     return v;
 }
 
 -(int64_t) readint64 {
-    int64_t v;
+    int64_t v = 0;
+    if(![self canRead:8]) {
+        NSLog(@"WKDataRead: readint64 越界（offset=%d, length=%lu）", self.offset, (unsigned long)self.buffData.length);
+        return 0;
+    }
     [WKDataRead numberHNMemcpy:&v src:[[self.buffData subdataWithRange:NSMakeRange(self.offset, 8)] bytes] count:8];
     self.offset+=8;
     return v;
 }
 
 -(NSData*) readData:(int)len {
-   NSData *data = [self.buffData subdataWithRange:NSMakeRange(self.offset, len)];
+    if(len <= 0) {
+        return [NSData data];
+    }
+    if(![self canRead:(NSUInteger)len]) {
+        NSLog(@"WKDataRead: readData 越界（len=%d, offset=%d, length=%lu）", len, self.offset, (unsigned long)self.buffData.length);
+        return [NSData data];
+    }
+    NSData *data = [self.buffData subdataWithRange:NSMakeRange(self.offset, len)];
     self.offset+=len;
     return data;
 }
 
 -(NSString*) readString {
+    if(![self canRead:2]) {
+        NSLog(@"WKDataRead: readString 长度字段越界（offset=%d, length=%lu）", self.offset, (unsigned long)self.buffData.length);
+        return @"";
+    }
     uint16_t len = [self readUint16];
     if(len == 0) {
         return @"";
     }
-   NSData *d = [self.buffData subdataWithRange:NSMakeRange(self.offset, len)];
+    if(![self canRead:len]) {
+        NSLog(@"WKDataRead: readString 内容越界（len=%u, offset=%d, length=%lu）", len, self.offset, (unsigned long)self.buffData.length);
+        return @"";
+    }
+    NSData *d = [self.buffData subdataWithRange:NSMakeRange(self.offset, len)];
     self.offset += len;
     
     return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
 }
-
 
 -(BOOL) lengthFull {
     uint32_t rLength = 0;
@@ -180,6 +225,10 @@
     uint32_t rLength = 0;
     uint32_t multiplier = 0;
     while (multiplier < 27) {
+        if(![self canRead:1]) {
+            NSLog(@"WKDataRead: readLenth 越界（offset=%d, length=%lu）", self.offset, (unsigned long)self.buffData.length);
+            break;
+        }
         uint8_t digit = [self readUint8];
         rLength |= ((uint32_t)digit&127) << multiplier;
         if ((digit & 128) == 0) {
@@ -196,6 +245,10 @@
     int i = self.offset;
     int  lengthL = 0;
     while (multiplier < 27) {
+        if(i < 0 || (NSUInteger)i >= self.buffData.length) {
+            NSLog(@"WKDataRead: lenthLength 越界（offset=%d, length=%lu）", i, (unsigned long)self.buffData.length);
+            break;
+        }
         lengthL ++;
         uint8_t digit;
         [WKDataRead numberHNMemcpy:&digit src:[[self.buffData subdataWithRange:NSMakeRange(i, 1)] bytes] count:1];
@@ -210,7 +263,9 @@
 }
 
 -(NSData*) remainingData {
-
+    if(!self.buffData || self.offset < 0 || (NSUInteger)self.offset >= self.buffData.length) {
+        return [NSData data];
+    }
     return  [self.buffData subdataWithRange:NSMakeRange(self.offset, self.buffData.length-self.offset)];
 }
 
