@@ -198,7 +198,12 @@
     NSData *d = [self.buffData subdataWithRange:NSMakeRange(self.offset, len)];
     self.offset += len;
     
-    return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    NSString *str = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if(!str) {
+        NSLog(@"WKDataRead: readString 内容非UTF-8（len=%u, offset=%d, length=%lu），按空串处理", len, self.offset-len, (unsigned long)self.buffData.length);
+        return @"";
+    }
+    return str;
 }
 
 -(BOOL) lengthFull {

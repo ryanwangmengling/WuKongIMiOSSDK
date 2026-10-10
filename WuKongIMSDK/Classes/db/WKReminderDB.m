@@ -61,7 +61,7 @@ static WKReminderDB *_instance;
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKReminder *reminder in reminders) {
             NSString *dataStr = [weakSelf dataToStr:reminder.data];
-            [db executeUpdate:SQL_ADD_UPDATE,@(reminder.reminderID),@(reminder.messageId),@(reminder.messageSeq),reminder.channel.channelId,@(reminder.channel.channelType),@(reminder.type),reminder.text?:@"",dataStr,reminder.publisher?:@"",@(reminder.isLocate),@(reminder.version),@(reminder.done)];
+            [db executeUpdate:SQL_ADD_UPDATE,@(reminder.reminderID),@(reminder.messageId),@(reminder.messageSeq),reminder.channel.channelId?:@"",@(reminder.channel.channelType),@(reminder.type),reminder.text?:@"",dataStr,reminder.publisher?:@"",@(reminder.isLocate),@(reminder.version),@(reminder.done)];
         }
     }];
 }

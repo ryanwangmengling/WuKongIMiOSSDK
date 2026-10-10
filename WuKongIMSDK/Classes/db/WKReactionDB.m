@@ -90,7 +90,7 @@ static WKReactionDB *_instance;
 -(BOOL) insertOrUpdateReactions:(NSArray<WKReaction*>*)reactions {
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKReaction *reaction in reactions) {
-            [db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId,@(reaction.channel.channelType),reaction.uid,reaction.emoji,@(reaction.version),reaction.createdAt,@(reaction.isDeleted)];
+            [db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId?:@"",@(reaction.channel.channelType),reaction.uid?:@"",reaction.emoji?:@"",@(reaction.version),reaction.createdAt?:@"",@(reaction.isDeleted)];
         }
         
     }];
@@ -99,7 +99,7 @@ static WKReactionDB *_instance;
 
 -(BOOL) insertOrUpdateReactions:(NSArray<WKReaction*>*)reactions db:(FMDatabase*)db {
     for (WKReaction *reaction in reactions) {
-        [db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId,@(reaction.channel.channelType),reaction.uid,reaction.emoji,@(reaction.version),reaction.createdAt,@(reaction.isDeleted)];
+        [db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId?:@"",@(reaction.channel.channelType),reaction.uid?:@"",reaction.emoji?:@"",@(reaction.version),reaction.createdAt?:@"",@(reaction.isDeleted)];
     }
     return true;
 }
@@ -120,8 +120,8 @@ static WKReactionDB *_instance;
     WKReaction *reaction = [WKReaction new];
     reaction.uid = [resultSet stringForColumn:@"uid"]?:@"";
     reaction.messageId = [resultSet unsignedLongLongIntForColumn:@"message_id"];
-    reaction.emoji = [resultSet stringForColumn:@"emoji"];
-    reaction.createdAt = [resultSet stringForColumn:@"created_at"];
+    reaction.emoji = [resultSet stringForColumn:@"emoji"]?:@"";
+    reaction.createdAt = [resultSet stringForColumn:@"created_at"]?:@"";
     reaction.isDeleted = [resultSet intForColumn:@"is_deleted"];
     NSString *channelID = [resultSet stringForColumn:@"channel_id"] ?:@"";
     NSInteger channelType = [resultSet intForColumn:@"channel_type"];

@@ -139,7 +139,7 @@ static WKChannelMemberDB *_instance;
     }
     [[WKDB sharedDB].dbQueue  inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKChannelMember *member in members) {
-            [db executeUpdate:SQL_MEMBER_UPDATE_OR_ADD,member.channelId?:@"",@(member.channelType),member.memberUid,member.memberName?:@"",member.memberAvatar?:@"",member.memberRemark?:@"",@(member.role),@(member.status),member.version?:@(0),[self extraToStr:member.extra],member.createdAt?:@"",member.updatedAt?:@"",@(member.robot),member.isDeleted?@(1):@(0)];
+            [db executeUpdate:SQL_MEMBER_UPDATE_OR_ADD,member.channelId?:@"",@(member.channelType),member.memberUid?:@"",member.memberName?:@"",member.memberAvatar?:@"",member.memberRemark?:@"",@(member.role),@(member.status),member.version?:@(0),[self extraToStr:member.extra],member.createdAt?:@"",member.updatedAt?:@"",@(member.robot),member.isDeleted?@(1):@(0)];
         }
     }];
 }
@@ -350,7 +350,7 @@ static WKChannelMemberDB *_instance;
     WKChannelMember *member = [WKChannelMember new];
     member.channelId = [resultSet stringForColumn:@"channel_id"];
     member.channelType = [resultSet intForColumn:@"channel_type"];
-    member.memberUid = [resultSet stringForColumn:@"member_uid"];
+    member.memberUid = [resultSet stringForColumn:@"member_uid"]?:@"";
     member.memberName = [resultSet stringForColumn:@"member_name"];
     member.memberAvatar = [resultSet stringForColumn:@"member_avatar"];
     member.memberRemark = [resultSet stringForColumn:@"member_remark"];

@@ -969,11 +969,34 @@ for (NSInteger i=0; i<channelIDs.count; i++) {
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r29 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，`WKSecurityManager.m` 无 `-Wnonnull` 警告（`sharedKey` 改 nullable 后消除），日志 `/tmp/wk_build_r29b.log`。本轮未新增文件，无需 `pod install`。
 
 ---
+
+## Round 30 — 网络字符串解码与 DB 写入空值兜底（Android parity）（2026-10-11）
+
+### 30.1 背景
+- 延续 Round 26/29 的「nil 字符串 → 绑定 NULL → NOT NULL 约束失败/静默丢数据」模式：`WKDataRead.readString`（`WuKongIMSDK/Classes/coder/WKData.m:185-202`）在长度字段/内容越界时返回 `@""`（:188/:196）、len==0 返回 `@""`（:192），但 **:201 `[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]` 遇到非 UTF-8 字节返回 nil**。该方法声明于 `WKData.h:58`、文件处于 `NS_ASSUME_NONNULL_BEGIN`（`WKData.h:10`）下，返回 nil 违反 nonnull 契约；Android `new String(bytes, UTF_8)` 永不返回 null —— parity gap。
+- nil 传播面：`readString` 消费者 9 处（`WKRecvPacket.m:36 msgKey / :37 fromUid / :38 channelId / :44 clientMsgNo / :46 streamNo / :55 topic`、`WKDisconnectPacket.m:28 reason`、`WKConnackPacket.m:37 serverKey / :38 salt`，R29 已对 serverKey/salt 加长度守卫）。nil 继续流向 DB 写绑定即变 NULL，命中 `client_msg_no`/`channel_id`/`member_uid` 等 NOT NULL 列 → 约束失败 → 该行静默不入库（R26 已在 WKMessageDB 证实此模式并仅对 message 表兜底）。
+- 全库剩余未兜底的 NOT NULL 文本列写绑定（本轮 B 项）：`WKReactionDB.m:93/:102`（channelId/uid/emoji/createdAt）、`WKChannelMemberDB.m:142`（memberUid）、`WKReminderDB.m:64`（channelId）、`WKConversationDB.m:99/:114`（channelId）。
+
+### 30.2 改动（5 个文件）
+A. 根因修复 `WuKongIMSDK/Classes/coder/WKData.m` `readString`（:198-206）：UTF-8 解码失败不再返回 nil，改打 `WKDataRead: readString 内容非UTF-8...` 日志并返回 `@""`，使方法满足 nonnull 契约、与 Android 行为一致。所有消费者把「nil」与「空串」按同一语义处理（`WKRecvPacket.m:61-64` 的 msgKey 校验 `![exceptMsgKey isEqualToString:]` 对 nil/`@""` 结果相同），无行为回归。
+B. 写侧兜底（补 `?:@""`）：`WKReactionDB.m:93`/`:102`、`WKChannelMemberDB.m:142`、`WKReminderDB.m:64`、`WKConversationDB.m:99`/`:114`。避免任一字段为 nil 时绑定 NULL 触发 NOT NULL 约束失败。
+C. 读侧一致性：`WKReactionDB.m:123-124`（emoji/createdAt）、`WKChannelMemberDB.m:353`（memberUid）补 `?:@""`，与此前已有兜底的 uid（`WKReactionDB.m:121`）/channelId（:126）一致。
+对应 Android 实现：无直接对应提交，属 Android `new String(bytes, UTF_8)` 永不返回 null 的固有行为对齐；DB 兜底延续 R26 模式。
+
+### 30.3 判定
+- 不改 readString 的越界分支（已返回 `@""`）。
+- `WKReactionDB.insertOrUpdateReactions:` 仍返回 `true` 而无视 executeUpdate 失败（批量写忽略失败属既有设计，本轮仅消除 nil→NULL 这一可避免的失败源，未改返回值语义）。
+- 未纳入本轮：`WKConnectionManager` 4 处未受 `isDebug` 保护的 NSLog（:596/:615/:818/:1037）经复核全为异常/错误路径，保留无条件日志合理；`WKAESUtil` nil key 静默全零 key 属安全降级，单独评估。
+
+### 30.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r30 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r30.log`。
+
+---
 ## 待办（后续轮次）
-- Round 30 候选（按优先级）：
-  1. `WKConnectionManager` 其余未受 `isDebug` 保护的低频/异常日志（`Classes/manager/WKConnectionManager.m` :596/:615/:818/:1037）是否统一收敛。
-  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径的失败处理）。
+- Round 31 候选（按优先级）：
+  1. `WKConnectionManager` 4 处未受 `isDebug` 保护的 NSLog 经复核为异常/错误路径、保留；改排查是否有 payload/敏感信息在非 isDebug 路径被打印。
+  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径失败处理）。
   3. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
-  4. `WKReminderDB` 其余写路径（`addOrUpdates:` `insertOrUpdateReminders:` 等）的失败处理与批量写走查。
+  4. `WKReactionDB.insertOrUpdateReactions:` 返回 true 无视 executeUpdate 失败，评估是否应聚合失败并返回 NO（需查调用方）。
   5. 复核 `WKAESUtil` 在 nil key/iv 时用全零 key 静默降级，是否应改为显式拒绝发送（待评估）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

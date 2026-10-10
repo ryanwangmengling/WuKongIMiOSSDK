@@ -96,7 +96,7 @@ static WKConversationDB *_instance;
             NSString *parentChannelID  = conversation.parentChannel?conversation.parentChannel.channelId:@"";
             uint8_t parentChannelType = conversation.parentChannel?conversation.parentChannel.channelType:0;
             NSString *extraStr = [self extraToStr:conversation.extra];
-            [db executeUpdate:SQL_REPLACE,conversation.channel.channelId,@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
+            [db executeUpdate:SQL_REPLACE,conversation.channel.channelId?:@"",@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
         }
     }];
 }
@@ -111,7 +111,7 @@ static WKConversationDB *_instance;
     NSString *extraStr = [self extraToStr:conversation.extra];
     NSString *parentChannelID  = conversation.parentChannel?conversation.parentChannel.channelId:@"";
     uint8_t parentChannelType = conversation.parentChannel?conversation.parentChannel.channelType:0;
-    [db executeUpdate:SQL_INSERT,conversation.channel.channelId,@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
+    [db executeUpdate:SQL_INSERT,conversation.channel.channelId?:@"",@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
 }
 
 -(void) clearConversationUnreadCount:(WKChannel*)channel {
