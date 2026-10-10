@@ -1026,11 +1026,35 @@ C. 让根因可观测：
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r31 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0；本轮 7 个源文件无新增告警（唯一的 `WKConnectionManager.m:1130` retain-cycle 警告为既有的、不在改动区域内），日志 `/tmp/wk_build_r31.log`。
 
 ---
+
+## Round 32 — 回应入库不再谎报成功：批量写失败回滚 + 失败不通知 delegate（2026-10-11）
+
+### 32.1 背景
+- 承接 Round 31/26 的「DB 写失败静默」主题与本轮待办 #3：`WKReactionDB.insertOrUpdateReactions:`（`WuKongIMSDK/Classes/db/WKReactionDB.m`:90）与 `insertOrUpdateReactions:db:`（:100）无条件 `return true`，循环内 `[db executeUpdate:SQL_INSERT_REACTIONS,...]` 的返回值被丢弃，入库失败无任何告警。
+- `WKReactionManager.sync:`（`WuKongIMSDK/Classes/manager/WKReactionManager.m`:90-92）拿到回应后先入库、紧接着 `callReactionManagerChangeDelegate:` 通知 UI，从不检查入库结果 → 若写库失败，UI 展示实际未落库的回应，重启后丢失。
+- 对照 Android `MsgReactionDBManager.insertReactions`（`wkim/src/main/java/com/xinbida/wukongim/db/MsgReactionDBManager.java`:35-58）：用事务 + `setTransactionSuccessful()`，异常时只 `endTransaction()`（等价回滚），即 Android 失败会整批回滚；iOS 此前既不回滚也不上报。Android 消费方 `MsgManager`（`MsgManager.java`:1007-1017）写库后再 `getMsgReactionsAndRefreshMsg` 从 DB 重建，UI 以 DB 为准；iOS 直接拿服务端对象通知，缺少这层一致性。
+- 另：`[WKDB sharedDB].dbQueue` 为 nil（DB 未打开，`WKDB.switchDB:` 失败时置空）时 `inTransaction:` 是 no-op，原实现直接返回 true（谎报成功）。
+
+### 32.2 改动（3 个文件 / 3 处）
+1. `WuKongIMSDK/Classes/db/WKReactionDB.m` `insertOrUpdateReactions:`（:90-112）：空数组早退 YES；`dbQueue == nil` 时打 `WARN: 回应入库失败：数据库不可用` 并 return NO；事务内逐条检查 `executeUpdate:` 返回值，任一条失败则 `success = NO`、打 `WARN: 回应入库失败已回滚 ... error:%@`（`db.lastErrorMessage`）、`*rollback = YES` 并结束；返回真实 `success`。
+2. 同文件 `insertOrUpdateReactions:db:`（:114-132）：空数组/`db == nil` 早退与告警；逐条检查返回值，失败打 `WARN: 回应入库失败(事务内) ...` 并返回真实结果（**不**主动回滚外层事务，避免单条回应失败导致整条消息丢失；回滚交由调用方 `WKMessageDB` 的事务决定）。
+3. `WuKongIMSDK/Classes/manager/WKReactionManager.m` `sync:`（:90-97）：检查返回值，失败时打 `WARN: 同步回应入库失败，本次不通知 delegate（下次同步将重试）...` 并 `return`，不再通知 delegate；成功才 `callReactionManagerChangeDelegate:`。
+- `WuKongIMSDK/Classes/db/WKReactionDB.h`（:30-40）补充两个方法的返回值语义注释。
+
+### 32.3 判定
+- 不移植 Android 的「写库后 query 回读刷新 UI」做法：iOS delegate 收到的就是服务端原样对象，与刚写入的整批数据一致，无需再查库；只在失败时停止通知即可。
+- `insertOrUpdateReactions:db:` 选择「记录失败但不由本方法回滚」：它被 `WKMessageDB.saveMessages:`（:245）与 `replaceMessages:`（:293）在消息落库事务内调用，若在此回滚会连消息一起丢；R26 已让消息落库失败被识别并跳过，回应失败只降级为告警。
+- `WKMessageDB` 两处调用仍忽略返回值（消息保存不应因回应写失败而失败），但失败现在有 `WARN` 可观测。
+
+### 32.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r32 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，三个改动文件无新增告警，日志 `/tmp/wk_build_r32.log`。
+
+---
 ## 待办（后续轮次）
-- Round 32 候选（按优先级）：
+- Round 33 候选（按优先级）：
   1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径失败处理）。
-  2. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
-  3. `WKReactionDB.insertOrUpdateReactions:` 返回 true 无视 executeUpdate 失败，评估是否应聚合失败并返回 NO（需查调用方）。
+  2. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交（`aef4cb6` 无网络重连计数已在 iOS `backoffReconnect`/onNetworkStatusChange 覆盖，判定为已覆盖）。
+  3. 其余批量写（`WKChannelMemberDB.addOrUpdateMembers:`、`WKReminderDB`、`WKConversationDB`）同样忽略 executeUpdate 失败，评估是否值得聚合失败上报（这些方法返回 void，需改签名/查调用方）。
   4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30 已复核 :596/:615/:818/:1037 为异常路径、保留）。
-  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（本轮 B 项 6 已改为不崩溃，错包应由服务端/上层重试处理）。
+  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃，错包应由服务端/上层重试处理）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

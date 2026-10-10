@@ -28,10 +28,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 
 /**
- 插入回应
+ 插入回应。返回 YES 表示整批成功；任一条失败会整批回滚并返回 NO（调用方应据此决定是否对外通知）
  */
 -(BOOL) insertOrUpdateReactions:(NSArray<WKReaction*>*)reactions;
 
+/**
+ 在调用方事务内插入回应。返回 YES 表示全部成功；失败返回 NO 且不主动回滚外层事务
+ */
 -(BOOL) insertOrUpdateReactions:(NSArray<WKReaction*>*)reactions db:(FMDatabase*)db;
 
 /**

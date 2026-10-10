@@ -87,21 +87,48 @@ static WKReactionDB *_instance;
     return reactionDict;
 }
 
+// 回应批量入库。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO，
+// 避免只写入一部分导致回应集合不完整（Round 32，对应 Android MsgReactionDBManager.insertReactions）
 -(BOOL) insertOrUpdateReactions:(NSArray<WKReaction*>*)reactions {
+    if(!reactions || reactions.count == 0) {
+        return YES;
+    }
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 回应入库失败：数据库不可用，数量:%lu",(unsigned long)reactions.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKReaction *reaction in reactions) {
-            [db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId?:@"",@(reaction.channel.channelType),reaction.uid?:@"",reaction.emoji?:@"",@(reaction.version),reaction.createdAt?:@"",@(reaction.isDeleted)];
+            if(![db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId?:@"",@(reaction.channel.channelType),reaction.uid?:@"",reaction.emoji?:@"",@(reaction.version),reaction.createdAt?:@"",@(reaction.isDeleted)]) {
+                success = NO;
+                NSLog(@"WARN: 回应入库失败已回滚 messageId:%llu uid:%@ emoji:%@ error:%@",reaction.messageId,reaction.uid?:@"",reaction.emoji?:@"",db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
-        
     }];
-    return true;
+    return success;
 }
 
+// 在调用方事务内批量入库（如消息落库）。返回 YES 表示全部成功；失败返回 NO 并打日志但不回滚，
+// 是否回滚由外层事务决定，避免因单条回应失败而丢失整条消息（Round 32）
 -(BOOL) insertOrUpdateReactions:(NSArray<WKReaction*>*)reactions db:(FMDatabase*)db {
-    for (WKReaction *reaction in reactions) {
-        [db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId?:@"",@(reaction.channel.channelType),reaction.uid?:@"",reaction.emoji?:@"",@(reaction.version),reaction.createdAt?:@"",@(reaction.isDeleted)];
+    if(!reactions || reactions.count == 0) {
+        return YES;
     }
-    return true;
+    if(db == nil) {
+        NSLog(@"WARN: 回应入库失败：db 为空，数量:%lu",(unsigned long)reactions.count);
+        return NO;
+    }
+    BOOL success = YES;
+    for (WKReaction *reaction in reactions) {
+        if(![db executeUpdate:SQL_INSERT_REACTIONS,@(reaction.messageId),reaction.channel.channelId?:@"",@(reaction.channel.channelType),reaction.uid?:@"",reaction.emoji?:@"",@(reaction.version),reaction.createdAt?:@"",@(reaction.isDeleted)]) {
+            success = NO;
+            NSLog(@"WARN: 回应入库失败(事务内) messageId:%llu uid:%@ emoji:%@ error:%@",reaction.messageId,reaction.uid?:@"",reaction.emoji?:@"",db.lastErrorMessage);
+        }
+    }
+    return success;
 }
 
 -(uint64_t) maxVersion:(WKChannel*) channel {

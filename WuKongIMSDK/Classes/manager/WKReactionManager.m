@@ -87,7 +87,12 @@ static WKReactionManager *_instance;
             return;
         }
         
-        [[WKReactionDB shared] insertOrUpdateReactions:reactions];
+        BOOL inserted = [[WKReactionDB shared] insertOrUpdateReactions:reactions];
+        if(!inserted) {
+            // 入库失败时不通知 delegate：避免 UI 展示实际未落库的回应；maxVersion 未推进，下次同步会重试（Round 32）
+            NSLog(@"WARN: 同步回应入库失败，本次不通知 delegate（下次同步将重试）频道:%@ 数量:%lu",channel.channelId?:@"",(unsigned long)reactions.count);
+            return;
+        }
         
         [weakSelf callReactionManagerChangeDelegate:reactions channel:channel];
     });
