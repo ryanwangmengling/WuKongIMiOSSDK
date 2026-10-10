@@ -176,22 +176,20 @@ static WKReminderDB *_instance;
         return nil;
     }
     NSMutableArray *channelIDs = [NSMutableArray array];
+    NSMutableArray<NSString*> *placeholders = [NSMutableArray array];
     for (WKChannel *channel in channels) {
-        [channelIDs addObject:channel.channelId];
+        [channelIDs addObject:channel.channelId?:@""];
+        [placeholders addObject:@"?"];
     }
     __block NSMutableArray *reminders = [NSMutableArray array];
-    NSString *inquery = @"";
-    for (NSInteger i=0; i<channelIDs.count; i++) {
-        NSString *channelID = channelIDs[i];
-        if(i == channels.count-1) {
-            inquery = [NSString stringWithFormat:@"%@'%@'",inquery,channelID];
-        }else {
-            inquery = [NSString stringWithFormat:@"%@'%@',",inquery,channelID];
-        }
-        
-    }
+    // 频道ID改用占位符绑定，避免含单引号的频道ID拼出非法SQL / 注入
+    // （对应 Android 65c6eec：ReminderDBManager.queryWithChannelIds 从手工拼 '...' 改为 getPlaceholders + 参数绑定）
+    NSString *inquery = [placeholders componentsJoinedByString:@","];
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        FMResultSet *resultSet =  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_GET_NO_DONE_WITH_CHANNELS,inquery],WKSDK.shared.options.connectInfo.uid?:@""];
+        // SQL 中 publisher<>? 在 IN 之前，参数顺序必须是 [uid, channelId...]
+        NSMutableArray *args = [NSMutableArray arrayWithObject:WKSDK.shared.options.connectInfo.uid?:@""];
+        [args addObjectsFromArray:channelIDs];
+        FMResultSet *resultSet =  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_GET_NO_DONE_WITH_CHANNELS,inquery] withArgumentsInArray:args];
         while (resultSet.next) {
             WKReminder *reminder = [self toReminder:resultSet];
             [reminders addObject:reminder];

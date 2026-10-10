@@ -885,11 +885,47 @@ Android 无对应 commit：Android 侧无 `updateChannelSetting`/`ChannelSetting
 ### 26.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r26 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`error:` 计数 0）。本轮未新增文件，无需 `pod install`。
 
+## Round 27 — 提醒项按频道查询的 IN 列表改为占位符绑定（移植 Android 65c6eec）（2026-10-10）
+
+### 27.1 背景
+`WuKongIMSDK/Classes/db/WKReminderDB.m` 的 `getWaitDoneReminders:`（:174-211）需要把一批频道 ID 拼进 `channel_id in (...)`，原实现用字符串插值手工拼引号：
+
+```objc
+for (NSInteger i=0; i<channelIDs.count; i++) {
+    NSString *channelID = channelIDs[i];
+    ...
+    inquery = [NSString stringWithFormat:@"%@'%@'",inquery,channelID];
+}
+...
+[db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_GET_NO_DONE_WITH_CHANNELS,inquery],
+              WKSDK.shared.options.connectInfo.uid?:@""];
+```
+
+- 频道 ID 含单引号时拼出非法 SQL，FMDB 返回 nil resultSet，`while (resultSet.next)` 静默变成 no-op，**提醒项被静默丢弃**；同时存在 SQL 注入面。
+- 频道 ID 为 nil 时拼出 `'(null)'`，同样查不到。
+- 该方法是热路径，调用方：`WKConversationManager.m:111/:238/:308`、`WKReminderManager.m:172`（每次会话列表/提醒刷新）。
+
+### 27.2 改动（`WuKongIMSDK/Classes/db/WKReminderDB.m`）
+对应 Android 提交 `65c6eec "update Optimize message queries"`（2023-12-05）：其把 `ReminderDBManager.queryWithChannelIds` 从 `stringBuffer.append("'").append(channelIds.get(i)).append("'")` + `rawQuery(sql, new Object[]{stringBuffer.toString()})` 改为 `select(reminders, "channel_id in (" + WKCursor.getPlaceholders(channelIds.size()) + ")", channelIds.toArray(new String[0]), null)`；当前 Android `db/ReminderDBManager.java:163` 即占位符版。
+
+1. 循环内同时构造占位符数组：`NSMutableArray<NSString*> *placeholders`（每个 `@"?"`），频道 ID 统一做 `channel.channelId ?: @""` 兜底。
+2. `inquery` 改为 `[placeholders componentsJoinedByString:@","]`，不再出现单引号。
+3. `inDatabase:` 块内构造 `NSMutableArray *args`，首元素为 `WKSDK.shared.options.connectInfo.uid ?: @""`（`SQL_GET_NO_DONE_WITH_CHANNELS` 中 `publisher<>?` 位于 IN 之前），再 `addObjectsFromArray:channelIDs`。
+4. 查询改为 `...withArgumentsInArray:args`，全部值走 SQLite 参数绑定。
+
+### 27.3 判定不移植 / 附带结论
+- Android `65c6eec` 还同时把 `ChannelDBManager`/`ChannelMembersDbManager`/`ConversationDbManager`/`MsgDbManager`/`MsgReactionDBManager`/`RobotDBManager` 改为占位符；这些 iOS 已在 Round 20/R21 用 `?` + `withArgumentsInArray:` 覆盖（`WKRobotDB.m:54/:75`、`WKChannelMemberDB.m`、`WKConversationDB.m` 等），**`WKReminderDB` 是 `65c6eec` 在 iOS 侧的最后一块遗漏**，本轮补齐。
+- **复核后不改**：`WKChannelMemberDB.getMembersWithChannel:keyword:page:limit:`（:190-205）的 `offset=(page-1)*limit`。Android `ChannelMembersDbManager.java:43-85 search/queryWithPage` 是**完全相同**的 `int queryPage = (page-1)*size` 且同样未夹取；SQLite 规定负 OFFSET 等同 0，page==0 不崩、行为与 Android 一致，故不视为缺陷。
+- 同步排除的 Android 提交：`aef4cb6`（无网络不累加重连计数）已由 iOS `SKConnectionManager.m backoffReconnect`（:466-508，`!networkAvailable` 时直接 return）与 `:545-578` 网络恢复归零覆盖，连接前地址校验也已由 `WKConnectionManager.m:247` 覆盖；`789faba`（附件 type 缺失）iOS `WKMessageContent.m:75-82 encode` 本就写入 `type`，不适用；`a7984b8`/`275ebfb` 仅删日志参数与死代码，已在 MODIFICATIONS.md:306/:605 记录为架构级重构不移植。
+
+### 27.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r27 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r27.log`）。本轮未新增文件，无需 `pod install`。
+
 ---
 ## 待办（后续轮次）
-- Round 27 候选（按优先级）：
-  1. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查：`WKChannelMemberDB.getMembersWithChannel:keyword:page:limit:`（:190-205）`offset=(page-1)*limit` 在 `page==0` 时为负偏移、未夹取。
-  2. `WKConnectionManager` 其余未受 `isDebug` 保护的低频/异常日志（:596/:615/:812/:1013/:1072）是否统一收敛。
-  3. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径的失败处理）。
-  4. R20 遗留 `WKRobotDB.m:52/71` 双引号拼 `IN (...)`：R21 已改为 `?` 占位符绑定（`queryRobots:`/`queryRobotsWithUsernames:`），复核确认无残留。
+- Round 28 候选（按优先级）：
+  1. `WKConnectionManager` 其余未受 `isDebug` 保护的低频/异常日志（:596/:615/:812/:1013/:1072）是否统一收敛。
+  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径的失败处理）。
+  3. 继续用 `git log --oneline` 对照 MODIFICATIONS.md 哈希，筛 Android 未移植的 db/连接稳定性提交（`65c6eec` 系列已收口，查其余 `ReminderDBManager`/`MsgReactionDBManager` 写路径）。
+  4. `WKReminderDB` 其余写路径（`insertOrUpdateReminders:` 等）的失败处理与批量写走查。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
