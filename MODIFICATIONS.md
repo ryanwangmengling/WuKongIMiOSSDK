@@ -1049,12 +1049,44 @@ C. 让根因可观测：
 ### 32.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r32 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，三个改动文件无新增告警，日志 `/tmp/wk_build_r32.log`。
 
+## Round 33 — 其余批量写不再静默丢失：会话/提醒/成员入库失败整批回滚 + 失败不通知 UI（2026-10-12）
+
+### 33.1 背景
+- 承接 Round 32 的「DB 写失败静默」主题与本轮待办 #3：以下批量写方法在事务内循环 `[db executeUpdate:...]` 但完全丢弃返回值，任一行失败既不回滚也不告警，调用方仍按「已落库」继续刷新 UI：
+  - `WKConversationDB.replaceConversations:`（`WuKongIMSDK/Classes/db/WKConversationDB.m`:90）——同步最近会话时整批替换；
+  - `WKConversationExtraDB.addOrUpdates:`（`db/WKConversationExtraDB.m`:45）——草稿/预览位置等会话扩展；
+  - `WKReminderDB.addOrUpdates:`（`db/WKReminderDB.m`:58）——提醒项；
+  - `WKChannelMemberDB.addOrUpdateMembers:`（`db/WKChannelMemberDB.m`:137）——群成员。
+- 另外三处 `extraToStr:`/`dataToStr:`（`WKConversationDB.m`:355、`WKChannelMemberDB.m`:403、`WKConversationExtraDB.m`:67 / `WKReminderDB.m`:254）在 JSON 序列化失败时 `[[NSString alloc] initWithData:nil ...]` 会返回 **nil**，而对应列 schema 为 `not null default ''`（`Assets/Migrations/202204121358.sql`：reminders.data、conversation_extra；`Assets/Migrations/201911270513.sql`：conversation.extra、channel_member.extra 均为 `text not null default ''`）——绑定 nil 即 NULL，整行写入必然失败且被静默忽略。
+- `[WKDB sharedDB].dbQueue` 为 nil（DB 未打开，`WKDB.switchDB:` 失败时置空）时 `inTransaction:` 是 no-op，原实现直接「成功」返回。
+
+### 33.2 改动（10 个文件 / 12 处）
+1. `db/WKConversationDB.m` `replaceConversations:`（:90）：改返回 `BOOL`；`dbQueue==nil` 打 `WARN: 最近会话批量替换失败：数据库不可用` 返回 NO；`extraToStr:` 结果 `?:@""` 兜底；逐条检查 `executeUpdate:`，失败打 `WARN: 最近会话批量替换失败已回滚 ... error:%@`（`db.lastErrorMessage`）、`*rollback = YES`、返回 NO。`db/WKConversationDB.h`:29 同步签名与注释。
+2. `db/WKConversationExtraDB.m` `addOrUpdates:`（:45）：改返回 `BOOL`；`dbQueue==nil` 告警返回 NO；`channelId` 补 `?:@""`；逐条检查，失败 `WARN: 最近会话扩展入库失败已回滚 ...` + 回滚 + NO。`db/WKConversationExtraDB.h`:17 同步。
+3. `db/WKReminderDB.m` `addOrUpdates:`（:58）：改返回 `BOOL`；`dataToStr:` 结果 `?:@""` 兜底（新增，修 `data` NOT NULL 失败）；逐条检查，失败 `WARN: 提醒项入库失败已回滚 ...` + 回滚 + NO。`db/WKReminderDB.h`:18 同步。
+4. `db/WKChannelMemberDB.m` `addOrUpdateMembers:`（:137）：改返回 `BOOL`；`extraToStr:` 结果 `?:@""` 兜底；逐条检查，失败 `WARN: 成员入库失败已回滚 ...` + 回滚 + NO。`db/WKChannelMemberDB.h`:62 同步。
+5. 调用方——失败即跳过本地 UI 通知（延续 R32「失败不通知 delegate」）：
+   - `manager/WKConversationManager.m` `replaceConversations:` 处（:244）：失败打 `WARN: 最近会话批量入库失败，跳过通知` 并 return，不再 `callOnConversationUpdateDelegates:`；
+   - 同文件 `syncExtra`（:263）：失败打 `WARN` 并 return，不再 `updateConversationExtras:`（该方法从 DB 回读，写库未成功则回读无意义）；
+   - 同文件 `updateOrAddExtra:`（:273）：失败打 `WARN: 最近会话扩展入库失败，跳过本地通知与上传` 并 return，跳过本地 delegate 通知与 `updateConversationExtraProvider` 上传；
+   - `manager/WKReminderManager.m` `sync`（:126）：失败打 `WARN: 提醒项批量入库失败，跳过缓存失效与通知` 并 return，不再 `invalidateCacheForReminders:`/`updateConversations:`；
+   - `manager/WKChannelManager.m`:270 仍忽略返回值（成员同步失败下次同步重试），但 DB 层已有 `WARN` 可观测。
+
+### 33.3 判定（Android 对照）
+- 对应 Android：`ChannelMembersDbManager.insertMembers`（`wkim/src/main/java/com/xinbida/wukongim/db/ChannelMembersDbManager.java`:213-236）、`ConversationDbManager` 会话扩展批量写（`ConversationDbManager.java`:514-534）、`ReminderDBManager` 提醒批量写（`ReminderDBManager.java`:210-228）——均用 `db.beginTransaction()` + `setTransactionSuccessful()` + `finally endTransaction()`，异常时未 `setTransactionSuccessful` 即等价整批回滚。iOS 本轮补齐这一「失败整批回滚」语义。
+- Android 的 `catch (Exception ignored)` 同样吞掉异常，只是事务保证回滚；iOS 在此之上额外打 `WARN` 并把结果返回给调用方，使其能停止 UI 通知——强于 Android。
+- 未改动 `WKChannelManager.addOrUpdateMembers:`（manager）签名：它只负责清缓存 + 落库，失败对调用方无不同处理，保持 void 最小侵入。
+- `WKConversationDB.extraToStr:`/`WKChannelMemberDB.extraToStr:`/`WKConversationExtraDB.extraToStr:` 的其它调用点（`WKConversationDB.m`:111 `insertConversation:db:` 等）未在本轮收窄，仅在 `replaceConversations:`/`addOrUpdateMembers:` 内兜底——`insertConversation:db:` 走 `addOrUpdateConversation:` 单条路径，失败同样被上层忽略，留待后续轮次评估。
+
+### 33.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r33 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r33.log`。
+
 ---
 ## 待办（后续轮次）
-- Round 33 候选（按优先级）：
-  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径失败处理）。
-  2. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交（`aef4cb6` 无网络重连计数已在 iOS `backoffReconnect`/onNetworkStatusChange 覆盖，判定为已覆盖）。
-  3. 其余批量写（`WKChannelMemberDB.addOrUpdateMembers:`、`WKReminderDB`、`WKConversationDB`）同样忽略 executeUpdate 失败，评估是否值得聚合失败上报（这些方法返回 void，需改签名/查调用方）。
-  4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30 已复核 :596/:615/:818/:1037 为异常路径、保留）。
-  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃，错包应由服务端/上层重试处理）。
+- Round 34 候选（按优先级）：
+  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage:` 忽略落库结果；`WKMessageDB` 其余 void update 路径 `:692-743` 失败处理）。
+  2. `WKConversationDB.insertConversation:db:`/`addOrUpdateConversation:` 及 `WKChannelMemberDB.deleteMembers:`/`WKConversationExtraDB.updateVersion:` 等单条写仍忽略失败，评估是否统一上报。
+  3. 继续用 `git log --oneline` 对照本文档哈希，筛 Android 未移植的 db/连接稳定性提交。
+  4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
+  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

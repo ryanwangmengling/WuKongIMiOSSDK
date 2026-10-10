@@ -13,7 +13,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (WKConversationExtraDB *)shared;
 
--(void) addOrUpdates:(NSArray<WKConversationExtra*>*)extras;
+/// 最近会话扩展批量入库。返回 YES 表示整批成功；任一条失败会整批回滚并返回 NO（Round 33）
+-(BOOL) addOrUpdates:(NSArray<WKConversationExtra*>*)extras;
 
 -(void) updateVersion:(WKChannel*)channel version:(int64_t)version;
 

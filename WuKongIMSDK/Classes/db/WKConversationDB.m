@@ -86,19 +86,31 @@ static WKConversationDB *_instance;
     }];
 }
 
--(void) replaceConversations:(NSArray<WKConversation*>*)conversations {
+// 取代最近会话。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 33）
+-(BOOL) replaceConversations:(NSArray<WKConversation*>*)conversations {
     if(!conversations || conversations.count<=0) {
-        return;
+        return YES;
     }
-   
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 最近会话批量替换失败：数据库不可用，数量:%lu",(unsigned long)conversations.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKConversation *conversation in conversations) {
             NSString *parentChannelID  = conversation.parentChannel?conversation.parentChannel.channelId:@"";
             uint8_t parentChannelType = conversation.parentChannel?conversation.parentChannel.channelType:0;
-            NSString *extraStr = [self extraToStr:conversation.extra];
-            [db executeUpdate:SQL_REPLACE,conversation.channel.channelId?:@"",@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)];
+            // extraToStr: JSON 序列化失败会返回 nil，而 extra 列为 not null，需兜底为空串（Round 33）
+            NSString *extraStr = [self extraToStr:conversation.extra] ?: @"";
+            if(![db executeUpdate:SQL_REPLACE,conversation.channel.channelId?:@"",@(conversation.channel.channelType),parentChannelID,@(parentChannelType),conversation.avatar?:@"",conversation.lastClientMsgNo?:@"",@(conversation.lastMessageSeq),@(conversation.lastMsgTimestamp),@(conversation.unreadCount),extraStr,@(conversation.version),@(conversation.isDeleted)]) {
+                success = NO;
+                NSLog(@"WARN: 最近会话批量替换失败已回滚 channelId:%@ error:%@",conversation.channel.channelId?:@"",db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
     }];
+    return success;
 }
 
 -(void) addConversation:(WKConversation*)conversation {

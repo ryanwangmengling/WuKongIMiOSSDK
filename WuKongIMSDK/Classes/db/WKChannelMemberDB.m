@@ -133,15 +133,29 @@ static WKChannelMemberDB *_instance;
     return _instance;
 }
 
--(void) addOrUpdateMembers:(NSArray<WKChannelMember*>*)members {
+// 成员批量入库。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 33）
+-(BOOL) addOrUpdateMembers:(NSArray<WKChannelMember*>*)members {
     if(!members || members.count<=0) {
-        return;
+        return YES;
     }
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 成员入库失败：数据库不可用，数量:%lu",(unsigned long)members.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [[WKDB sharedDB].dbQueue  inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKChannelMember *member in members) {
-            [db executeUpdate:SQL_MEMBER_UPDATE_OR_ADD,member.channelId?:@"",@(member.channelType),member.memberUid?:@"",member.memberName?:@"",member.memberAvatar?:@"",member.memberRemark?:@"",@(member.role),@(member.status),member.version?:@(0),[self extraToStr:member.extra],member.createdAt?:@"",member.updatedAt?:@"",@(member.robot),member.isDeleted?@(1):@(0)];
+            // extraToStr: JSON 序列化失败会返回 nil，而 extra 列为 not null，需兜底为空串（Round 33）
+            NSString *extraStr = [self extraToStr:member.extra] ?: @"";
+            if(![db executeUpdate:SQL_MEMBER_UPDATE_OR_ADD,member.channelId?:@"",@(member.channelType),member.memberUid?:@"",member.memberName?:@"",member.memberAvatar?:@"",member.memberRemark?:@"",@(member.role),@(member.status),member.version?:@(0),extraStr,member.createdAt?:@"",member.updatedAt?:@"",@(member.robot),member.isDeleted?@(1):@(0)]) {
+                success = NO;
+                NSLog(@"WARN: 成员入库失败已回滚 channelId:%@ memberUid:%@ error:%@",member.channelId?:@"",member.memberUid?:@"",db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
     }];
+    return success;
 }
 
 -(void) deleteMembers:(WKChannel*)channel {

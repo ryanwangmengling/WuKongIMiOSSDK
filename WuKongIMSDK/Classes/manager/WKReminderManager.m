@@ -123,7 +123,10 @@ static WKReminderManager *_instance;
         for (WKReminder *reminder in reminders) {
             [sets addObject:reminder.channel];
         }
-        [[WKReminderDB shared] addOrUpdates:reminders];
+        if(![[WKReminderDB shared] addOrUpdates:reminders]) {
+            NSLog(@"WARN: 提醒项批量入库失败，跳过缓存失效与通知，数量:%lu",(unsigned long)reminders.count);
+            return;
+        }
         [weakSelf invalidateCacheForReminders:reminders];
         [weakSelf updateConversations:sets];
         

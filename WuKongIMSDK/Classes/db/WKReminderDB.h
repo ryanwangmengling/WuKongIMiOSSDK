@@ -14,7 +14,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (WKReminderDB *)shared;
 
--(void) addOrUpdates:(NSArray<WKReminder*>*)reminders;
+/// 提醒项批量入库。返回 YES 表示整批成功；任一条失败会整批回滚并返回 NO（Round 33）
+-(BOOL) addOrUpdates:(NSArray<WKReminder*>*)reminders;
 
 /**
  获取等待done的提醒项

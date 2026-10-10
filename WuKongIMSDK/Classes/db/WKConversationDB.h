@@ -25,7 +25,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 取代最近会话
 /// @param conversations <#conversation description#>
--(void) replaceConversations:(NSArray<WKConversation*>*)conversations;
+/// 取代最近会话。返回 YES 表示整批成功；任一条失败会整批回滚并返回 NO（Round 33）
+-(BOOL) replaceConversations:(NSArray<WKConversation*>*)conversations;
 
 
 /// 添加最近会话信息

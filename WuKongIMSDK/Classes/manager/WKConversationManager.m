@@ -241,7 +241,10 @@
                 conversation.reminders = reminderDict[conversation.channel];
             }
         }
-        [[WKConversationDB shared] replaceConversations:conversations];
+        if(![[WKConversationDB shared] replaceConversations:conversations]) {
+            NSLog(@"WARN: 最近会话批量入库失败，跳过通知，数量:%lu",(unsigned long)conversations.count);
+            return;
+        }
         [self callOnConversationUpdateDelegates:conversations];
     }
     
@@ -260,7 +263,10 @@
             NSLog(@"同步最近会话扩展失败！->%@",error);
             return;
         }
-        [[WKConversationExtraDB shared] addOrUpdates:extras];
+        if(![[WKConversationExtraDB shared] addOrUpdates:extras]) {
+            NSLog(@"WARN: 最近会话扩展入库失败，跳过本地刷新");
+            return;
+        }
         [weakSelf updateConversationExtras:extras];
     });
 }
@@ -270,7 +276,10 @@
         return;
     }
     
-    [[WKConversationExtraDB shared] addOrUpdates:@[extra]];
+    if(![[WKConversationExtraDB shared] addOrUpdates:@[extra]]) {
+        NSLog(@"WARN: 最近会话扩展入库失败，跳过本地通知与上传 channelId:%@",extra.channel.channelId?:@"");
+        return;
+    }
     if(!self.updateConversationExtraProvider) {
         NSLog(@"###########没有updateConversationExtraProvider###########");
         return;

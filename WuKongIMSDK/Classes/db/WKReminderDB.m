@@ -53,17 +53,31 @@ static WKReminderDB *_instance;
     return _instance;
 }
 
--(void) addOrUpdates:(NSArray<WKReminder*>*)reminders {
+// 提醒项批量入库。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO，
+// 避免只写入一部分导致提醒项不完整（Round 33）
+-(BOOL) addOrUpdates:(NSArray<WKReminder*>*)reminders {
     if(!reminders || reminders.count==0) {
-        return;
+        return YES;
+    }
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 提醒项入库失败：数据库不可用，数量:%lu",(unsigned long)reminders.count);
+        return NO;
     }
     __weak typeof(self) weakSelf = self;
+    __block BOOL success = YES;
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKReminder *reminder in reminders) {
-            NSString *dataStr = [weakSelf dataToStr:reminder.data];
-            [db executeUpdate:SQL_ADD_UPDATE,@(reminder.reminderID),@(reminder.messageId),@(reminder.messageSeq),reminder.channel.channelId?:@"",@(reminder.channel.channelType),@(reminder.type),reminder.text?:@"",dataStr,reminder.publisher?:@"",@(reminder.isLocate),@(reminder.version),@(reminder.done)];
+            // dataToStr: 在 JSON 序列化失败时会返回 nil，而 data 列为 not null，需兜底为空串（Round 33）
+            NSString *dataStr = [weakSelf dataToStr:reminder.data] ?: @"";
+            if(![db executeUpdate:SQL_ADD_UPDATE,@(reminder.reminderID),@(reminder.messageId),@(reminder.messageSeq),reminder.channel.channelId?:@"",@(reminder.channel.channelType),@(reminder.type),reminder.text?:@"",dataStr,reminder.publisher?:@"",@(reminder.isLocate),@(reminder.version),@(reminder.done)]) {
+                success = NO;
+                NSLog(@"WARN: 提醒项入库失败已回滚 reminderID:%llu channelId:%@ error:%@",reminder.reminderID,reminder.channel.channelId?:@"",db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
     }];
+    return success;
 }
 
 -(NSArray<WKReminder*>*) getWaitDoneReminders:(WKChannel*)channel type:(WKReminderType)type {

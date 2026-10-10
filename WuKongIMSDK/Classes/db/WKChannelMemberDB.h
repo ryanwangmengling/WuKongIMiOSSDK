@@ -58,7 +58,8 @@ typedef enum : NSUInteger {
 
  @param members <#members description#>
  */
--(void) addOrUpdateMembers:(NSArray<WKChannelMember*>*)members;
+/// 添加或更新成员。返回 YES 表示整批成功；任一条失败会整批回滚并返回 NO（Round 33）
+-(BOOL) addOrUpdateMembers:(NSArray<WKChannelMember*>*)members;
 
 
 /// 删除频道成员

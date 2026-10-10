@@ -41,15 +41,27 @@ static WKConversationExtraDB *_instance;
     }];
 }
 
--(void) addOrUpdates:(NSArray<WKConversationExtra*>*)extras {
+// 最近会话扩展批量入库。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 33）
+-(BOOL) addOrUpdates:(NSArray<WKConversationExtra*>*)extras {
     if(!extras || extras.count==0) {
-        return;
+        return YES;
     }
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 最近会话扩展入库失败：数据库不可用，数量:%lu",(unsigned long)extras.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
         for (WKConversationExtra *extra in extras) {
-            [db executeUpdate:SQL_ADD_UPDATE,extra.channel.channelId,@(extra.channel.channelType),@(0),@(extra.keepMessageSeq),@(extra.keepOffsetY),extra.draft?:@"",@(extra.version)];
+            if(![db executeUpdate:SQL_ADD_UPDATE,extra.channel.channelId?:@"",@(extra.channel.channelType),@(0),@(extra.keepMessageSeq),@(extra.keepOffsetY),extra.draft?:@"",@(extra.version)]) {
+                success = NO;
+                NSLog(@"WARN: 最近会话扩展入库失败已回滚 channelId:%@ error:%@",extra.channel.channelId?:@"",db.lastErrorMessage);
+                *rollback = YES;
+                return;
+            }
         }
     }];
+    return success;
 }
 
 -(NSString*) extraToStr:(NSDictionary*)extra {
