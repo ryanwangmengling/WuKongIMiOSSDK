@@ -699,7 +699,10 @@ static WKMessageDB *_instance;
 }
 
 -(void) updateMessageMaxSeqWithMessageIDOrClientMsgNo:(uint32_t)messageSeq messageID:(uint64_t)messageID clientMsgNo:(NSString*)clientMsgNo db:(FMDatabase*)db{
-    [db executeUpdate:SQL_MESSAGE_UPDATE_MAX_SEQ_WITH_MESSAGEID_OR_CLIENTMSGNO,@(messageSeq),@(messageSeq*WKOrderSeqFactor),@(messageID),clientMsgNo?:@""];
+    // Round 42：写失败不再静默（最大 messageSeq/orderSeq 未落库会导致消息排序错乱）
+    if(![db executeUpdate:SQL_MESSAGE_UPDATE_MAX_SEQ_WITH_MESSAGEID_OR_CLIENTMSGNO,@(messageSeq),@(messageSeq*WKOrderSeqFactor),@(messageID),clientMsgNo?:@""]) {
+        NSLog(@"WARN: 更新消息最大序号失败 messageSeq:%u messageID:%llu clientMsgNo:%@ error:%@",messageSeq,messageID,clientMsgNo?:@"",db.lastErrorMessage);
+    }
 }
 
 -(void) updateMessageWithSendackPackets:(NSArray<WKSendackPacket*> *)sendackPackets {
@@ -1048,21 +1051,47 @@ static WKMessageDB *_instance;
 }
 
 
--(void) saveOrUpdateStreams:(NSArray<WKStream*>*)streams {
+// 批量入库流消息。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 42）
+-(BOOL) saveOrUpdateStreams:(NSArray<WKStream*>*)streams {
     if(!streams || streams.count == 0) {
-        return;
+        return YES;
     }
+    if([WKDB sharedDB].dbQueue == nil) {
+        NSLog(@"WARN: 流消息入库失败：数据库不可用，数量:%lu",(unsigned long)streams.count);
+        return NO;
+    }
+    __block BOOL success = YES;
     [[WKDB sharedDB].dbQueue inTransaction:^(FMDatabase * _Nonnull db, BOOL * _Nonnull rollback) {
-        
-        [self saveOrUpdateStreams:streams db:db];
+        if(![self saveOrUpdateStreams:streams db:db]) {
+            success = NO;
+            *rollback = YES;
+        }
     }];
+    if(!success) {
+        NSLog(@"WARN: 流消息批量入库失败已回滚 数量:%lu",(unsigned long)streams.count);
+    }
+    return success;
 }
 
--(void) saveOrUpdateStreams:(NSArray<WKStream*>*)streams db:(FMDatabase*)db{
+// 在调用方事务内批量入库（如消息落库）。返回 YES 表示全部成功；失败返回 NO 并打日志但不回滚，
+// 是否回滚由外层事务决定，避免因单条流失败而丢失整条消息（Round 42，同 insertOrUpdateReactions:db: 判定）
+-(BOOL) saveOrUpdateStreams:(NSArray<WKStream*>*)streams db:(FMDatabase*)db{
+    if(!streams || streams.count == 0) {
+        return YES;
+    }
+    if(db == nil) {
+        NSLog(@"WARN: 流消息入库失败：db 为空，数量:%lu",(unsigned long)streams.count);
+        return NO;
+    }
+    BOOL success = YES;
     for (NSInteger i=0; i<streams.count; i++) {
         WKStream *stream = streams[i];
-        [db executeUpdate:SQL_STREAM_SAVE_OR_UPDATE,stream.channel.channelId?:@"",@(stream.channel.channelType),stream.clientMsgNo?:@"",stream.streamNo?:@"",@(stream.streamSeq),stream.contentData?:@""];
+        if(![db executeUpdate:SQL_STREAM_SAVE_OR_UPDATE,stream.channel.channelId?:@"",@(stream.channel.channelType),stream.clientMsgNo?:@"",stream.streamNo?:@"",@(stream.streamSeq),stream.contentData?:@""]) {
+            success = NO;
+            NSLog(@"WARN: 流消息入库失败(事务内) streamNo:%@ streamSeq:%u error:%@",stream.streamNo?:@"",stream.streamSeq,db.lastErrorMessage);
+        }
     }
+    return success;
 }
 
 -(NSArray<WKStream*>*) getStreams:(NSString*)streamNo {

@@ -1408,14 +1408,47 @@ C. 让根因可观测：
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r41 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r41.log`。本轮未新增文件，无需 `pod install`。
 
 ---
+
+## Round 42 — 流式消息批量入库原子化 + 消息最大序号更新失败可观测（2026-10-16）
+
+### 42.1 背景
+- 承接 R32–R41「失败不得谎报成功 / 失败必须可观测」主线。R41 的扫尾把项目内 `executeUpdate` 丢弃返回值的点收敛到 4 处：`WKDB.m:113`（`PRAGMA synchronous=NORMAL`）与 `WKDB.m:187`（`DELETE FROM schema_migrations`）可忽略；真正的缺口是 `WKMessageDB.m:1064`（`saveOrUpdateStreams:db:` 内）与 `WKMessageDB.m:702`（`updateMessageMaxSeqWithMessageIDOrClientMsgNo:...db:`）。
+- 全项目 15 个 `inTransaction:` 中，除 `saveMessages:` / `replaceMessages:` / `saveOrUpdateStreams:` 外均已带显式 `*rollback`。`saveMessages:` / `replaceMessages:` 是 R34/R39 判定「不回滚整批、仅 WARN」的既有设计；**唯一真正的缺口是 `saveOrUpdateStreams:`**：它是专用事务却既不接内层返回值、也不置 `*rollback` → 流消息批量入库中途失败会部分提交，且调用方（`WKChatManager.handleMessages:` :603）完全无感。
+- `updateMessageMaxSeqWithMessageIDOrClientMsgNo:...db:` 虽当前全项目无调用点（`.h` 未声明），但丢返回值属同款隐患，顺带补齐 WARN 以防后续被启用时静默。
+
+### 42.2 Android 对照
+- **无直接对标 commit**：Android 的 sqlcipher 采用 `beginTransaction`/`setTransactionSuccessful`/`endTransaction`，异常会自动回滚；本轮是 iOS FMDB `inTransaction:` 不会因 `executeUpdate` 返回 NO 自动回滚这一差异的持续补齐（同 R33/R39/R41）。
+- Android 流式消息落库路径未发现与 iOS `saveOrUpdateStreams:` 等价的独立批量写方法；近期 Android commit 已逐个查证，可移植面基本耗尽。
+
+### 42.3 改动（3 个文件 / 4 处）
+一、`db/WKMessageDB.h:298-299`
+- `-(void) saveOrUpdateStreams:(NSArray<WKStream*>*)streams;` → `-(BOOL)`，注释补「返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 42）」。
+
+二、`db/WKMessageDB.m`
+- `updateMessageMaxSeqWithMessageIDOrClientMsgNo:messageID:clientMsgNo:db:`（:701-706）：`if(![db executeUpdate:...])` + WARN「更新消息最大序号失败 messageSeq:%u messageID:%llu clientMsgNo:%@ error:%@」。
+- `saveOrUpdateStreams:`（:1054-1074）：`void` → `BOOL`；空数组 `return YES`；`dbQueue == nil` WARN「流消息入库失败：数据库不可用」+ `return NO`；`__block BOOL success = YES`；`inTransaction:` 内 `if(![self saveOrUpdateStreams:streams db:db]) { success = NO; *rollback = YES; }`；失败 WARN「流消息批量入库失败已回滚 数量:%lu」；`return success`。
+- `saveOrUpdateStreams:db:`（:1076-1095）：`void` → `BOOL`；空数组 `return YES`；`db == nil` WARN + `return NO`；逐条 `if(![db executeUpdate:SQL_STREAM_SAVE_OR_UPDATE,...]) { success = NO; WARN「流消息入库失败(事务内) streamNo:%@ streamSeq:%u error:%@」; }`；`return success`。
+
+三、`manager/WKChatManager.m`
+- `handleMessages:`（:592-607）：`NSArray<WKStream*> *streams;` → `= nil`（防御性初始化）；:603-606 改为 `if(![WKMessageDB.shared saveOrUpdateStreams:needStoreStreams]) { NSLog(@"WARN: 流消息落库失败，本次流消息未持久化 数量:%lu",...); }`。
+
+### 42.4 判定
+- `saveOrUpdateStreams:`（专用事务）选 `BOOL + *rollback`：保证「要么整批成功、要么整批不落库」，与 R33/R39/R41 批量方法一致。
+- `saveOrUpdateStreams:db:`（被 `saveMessages:` / `replaceMessages:` 事务内复用）**只返回 BOOL + WARN、不回滚**：避免单条流失败连带丢弃已成功的主消息行（同 `insertOrUpdateReactions:db:` / `addOrUpdateMessageExtra:db:` 判定）。
+- **不因落库失败跳过 `callStreamDelegate:`**（:625-626）：该回调传入的 `streams = [self getStreams:streamMessages]` 包含 `noPersist` / `syncOnce` 项，是实时流内容事件、并非持久化成功声明，gating 会破坏流式 UX；失败仅由 :604 的 WARN 记录。
+- `updateMessageMaxSeqWithMessageIDOrClientMsgNo:...db:` 保持 `void`（无调用点、无补偿动作），仅补 WARN 可观测。
+
+### 42.5 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r42 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0（日志中仅有 WARN 字符串里的 "error:" 字面量），日志 `/tmp/wk_build_r42.log`。本轮未新增文件，无需 `pod install`。
+
+---
 ## 待办（后续轮次）
-- Round 42 候选（按优先级）：
-  1. 「单条写失败可观测」扫尾已基本完成（R37–R41）：仅剩 `WKMessageExtraDB` 剩余项与 `WKDB.m`（:113 `PRAGMA` / :187 `DELETE FROM schema_migrations` 可忽略）——无实际收益。
-  2. JSON 反序列化类型校验扫尾：再 grep 全项目 `JSONObjectWithData:`，确认无「只判 `!error` 即当字典用」的残留（`@try/@catch` 外为重点）。
-  3. 跨表事务「部分提交」面：`WKMessageDB.saveMessages:`/`replaceMessages:` 内 `addOrUpdateMessageExtra:db:`（R39 已加 WARN）、`insertOrUpdateReactions:db:`、`saveOrUpdateStreams:db:` 失败只 WARN、不回滚；是否整条回滚需权衡（回滚会丢弃已成功的主消息行）。
-  4. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。
-  5. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
-  6. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
-  7. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
-  8. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口。
-- 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
+- Round 42 已完成（R42 提交见下）。Round 43 候选（按优先级）：
+  1. **Android 可移植面已确认耗尽**（近 40 个 commit 全部查证，唯一未提及的 merge `1d6aa97` 内容已在 `bdc02e2` 覆盖；索引补丁 `5b69519` 已移植、WAL 1a48603/f193f42 已落 `WKDB.m:110-113`）→ 后续以 iOS 自有缺陷为主。
+  2. 跨表事务「部分提交」面：`saveMessages:`/`replaceMessages:` 内 `addOrUpdateMessageExtra:db:`（R39 已 WARN）、`insertOrUpdateReactions:db:`、`saveOrUpdateStreams:db:`（R42 已 BOOL+WARN）失败只 WARN 不回滚——R42 维持既有判定（回滚会丢弃已成功主消息行）；如要覆盖需单独权衡。
+  3. `WKConversationDB.updateConversation:`（`WKConversation*` 无 db 重载）仍 fire-and-forget（下层 `updateConversation:db:` 已 BOOL+WARN，可按需接住）。
+  4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
+  5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
+  6. JSON 反序列化类型校验扫尾：全项目 `JSONObjectWithData:` 再确认无「只判 `!error` 即当字典用」残留（R40 已覆盖主要点；`@try/@catch` 外为重点）。
+  7. 崩溃面复查：越界（R37 前已核对）、JSON 类型（R40）、nil 字符串构造 data（R40）已覆盖；继续关注新引入代码路径。
+  8. 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

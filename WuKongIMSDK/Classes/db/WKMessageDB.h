@@ -295,8 +295,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 -(WKMessageContent*) decodeContent:(NSInteger)contentType data:(NSData *)contentData db:(FMDatabase*)db;
 
-// 保存流
--(void) saveOrUpdateStreams:(NSArray<WKStream*>*)streams;
+// 保存流。返回 YES 表示整批写入成功；任一条失败会整批回滚并返回 NO（Round 42）
+-(BOOL) saveOrUpdateStreams:(NSArray<WKStream*>*)streams;
 
 // 获取流
 -(NSArray<WKStream*>*) getStreams:(NSString*)streamNo;

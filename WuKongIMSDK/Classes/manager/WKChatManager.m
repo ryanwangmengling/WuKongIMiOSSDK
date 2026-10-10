@@ -590,7 +590,7 @@
     
     // 流消息
     NSArray<WKMessage*> *streamMessages =  [self filterStreamMessagesWithStreamFlagIng:messages];
-    NSArray<WKStream*> *streams;
+    NSArray<WKStream*> *streams = nil;
     if(streamMessages && streamMessages.count>0) {
         streams = [self getStreams:streamMessages];
         // 保存流式消息
@@ -600,7 +600,10 @@
                 [needStoreStreams addObject:[self toStream:m]];
             }
         }
-        [WKMessageDB.shared saveOrUpdateStreams:needStoreStreams];
+        // Round 42：接住批量入库结果，失败不再静默（下层的原子性回滚在 WKMessageDB 内完成）
+        if(![WKMessageDB.shared saveOrUpdateStreams:needStoreStreams]) {
+            NSLog(@"WARN: 流消息落库失败，本次流消息未持久化 数量:%lu",(unsigned long)needStoreStreams.count);
+        }
     }
     
     // cmd消息
