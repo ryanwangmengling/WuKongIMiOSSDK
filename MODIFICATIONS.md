@@ -735,15 +735,36 @@ Android 无对应提交：`ConversationDbManager` 用 `ContentValues` 按列名�
 ### 20.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r20 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r20.log`）。本轮未新增文件，无需 `pod install`。
 
----
+## Round 21 — 字符串列表 SQL IN 拼接统一改为占位符绑定（iOS 自有加固）（2026-10-09）
 
+### 21.1 背景
+承接 Round 20 对 `WKConversationDB getConversations:` 的同类加固，本轮把全库剩余「把字符串值用双引号包起来拼进 `IN (...)`」的写法统一改为 `?` 占位符 + `withArgumentsInArray:` 绑定。原实现形如 `[NSString stringWithFormat:@"\"%@\"",value]` 再 `componentsJoinedByString:@","` 拼 SQL。问题有两层：
+- SQLite 会把双引号 `"xxx"` 优先解析为标识符（列名），只有找不到同名列时才回退成字符串字面量（double-quoted string literal 旧行为）。若 SQLite/SQLCipher 以 `SQLITE_DBCONFIG_DQS_DML=0` 编译或运行时关闭该行为，`IN ("abc")` 会直接报 `no such column: abc`；即使开启，值里含 `"` 也会截断/破坏 SQL。
+- 字符串拼接本身是注入面，与 R20 同类。
+
+共 3 个文件、5 处：
+- `db/WKRobotDB.m:42-61` `queryRobots:`（`SQL_ROBOTS_WITH_IDS`）、`db/WKRobotDB.m:63-82` `queryRobotsWithUsernames:`（`SQL_ROBOTS_WITH_USERNAMES`）。
+- `db/WKChannelMemberDB.m:257-277` `getMembersWithChannel:uids:`（`SQL_MEMBER_LIST_WITH_UIDS`）、`db/WKChannelMemberDB.m:279-293` `updateMemberStatus:channel:uids:`（`SQL_UPDATE_MEMBER_STATUS`）。
+- `db/WKMessageDB.m:488-512` `getMessagesWithClientMsgNos:db:` 的多值分支（`SQL_MESSAGE_WITH_CLIENTMSGNOS`）。
+
+Android 无对应 commit：Android 用 `?`/`ContentValues` 具名绑定，无此拼接写法；本轮记为 iOS 自有加固。
+
+### 21.2 改动
+1. `WKRobotDB.m` 两处：按列表长度生成 `?,?,...`，`[... executeQuery:... withArgumentsInArray:bindValues]`；值取 `robotID?:@""` / `username?:@""`（原实现传 nil 会拼出无意义值）。
+2. `WKChannelMemberDB.m` 两处：`SQL_MEMBER_LIST_WITH_UIDS`/`SQL_UPDATE_MEMBER_STATUS` 的 `?` 顺序为「channel_id, channel_type, member_uid...」（查成员）/「status, channel_id, channel_type, member_uid...」（改状态），故 args 先放前缀参数、再追加每个 uid，使其与 SQL 文本中 `?` 出现顺序一致。
+3. `WKMessageDB.m` 多值分支同上；`clientMsgNos.count==1` 的单值分支本就使用 `SQL_MESSAGE_WITH_CLIENTMSGNO` + `?` 绑定（:494-495），保持不变。
+4. 空列表均已由各方法入口早退保护（`WKRobotDB.m:43/64`、`WKChannelMemberDB.m:258/280`、`WKMessageDB.m:489`），不会生成 `IN ()`。
+
+### 21.3 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r21 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r21.log`）。本轮未新增文件，无需 `pod install`。
+- 修改后重新 grep 双引号拼接模式（`\"%@\"`）于 `WuKongIMSDK/Classes` → 0 命中。
+
+---
 ## 待办（后续轮次）
-- Round 21 候选（按优先级）：
-  1. `WKRobotDB.m:52/71` 的 `IN ("robotID"/"username")` 双引号拼接改为占位符绑定（与 R20 同类加固；需确认无需兼容 SQLite 的 double-quoted string literal 行为）。
-  2. `WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）。
-  3. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
-  4. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
-- `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
-- `WKRetryManager` 重发链路在「已删除消息」上的行为复查（R16 后 `getMessageWithMessageId:` 对已删除消息返回 nil，需确认 :251/:393 的 nil 分支不会误判为「消息不存在」而丢弃重试）。
-- 全库其余「提前 return 不回调 complete」的 API 契约普查（本轮已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
+- Round 22 候选（按优先级）：
+  1. `WKMessageDB.saveMessages:`（:195-252）的 N+1 存在性查询批量化（对应 Android `d005ce6`/`18d12c6` 的性能精神，但 iOS 单批 `syncChannelMessageLimit` 仅 30 条，收益需先评估）。
+  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
+  3. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查（Android `b220233` 已判定 iOS 无 bug，但分页 + 缓存清理仍值得复查）。
+  4. `WKRetryManager` 重发链路在「已删除消息」上的行为复查（R16 后 `getMessageWithMessageId:` 对已删除消息返回 nil，需确认 :251/:393 的 nil 分支不会误判为「消息不存在」而丢弃重试）。
+  5. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue` 与 `WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager` 的 complete 路径）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

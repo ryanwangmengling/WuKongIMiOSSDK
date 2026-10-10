@@ -260,11 +260,14 @@ static WKChannelMemberDB *_instance;
     }
     __block NSMutableArray *members = [NSMutableArray array];
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        NSMutableArray *uidsIns = [NSMutableArray array];;
+        // 使用占位符绑定成员UID（原实现把 uid 用双引号包起来拼进 IN (...)，含引号的 uid 会生成非法SQL）
+        NSMutableArray *args = [NSMutableArray arrayWithObjects:channel.channelId?:@"",@(channel.channelType),nil];
+        NSMutableArray *placeholders = [NSMutableArray array];
         for (NSString *uid in uids) {
-            [uidsIns addObject:[NSString stringWithFormat:@"\"%@\"",uid]];
+            [placeholders addObject:@"?"];
+            [args addObject:uid?:@""];
         }
-        FMResultSet *resultSet = [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_MEMBER_LIST_WITH_UIDS,[uidsIns componentsJoinedByString:@","]],channel.channelId,@(channel.channelType)];
+        FMResultSet *resultSet = [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_MEMBER_LIST_WITH_UIDS,[placeholders componentsJoinedByString:@","]] withArgumentsInArray:args];
         while (resultSet.next) {
             [members addObject:[self toMemberModel:resultSet]];
         }
@@ -278,11 +281,14 @@ static WKChannelMemberDB *_instance;
         return;
     }
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        NSMutableArray *uidsIns = [NSMutableArray array];;
+        // 使用占位符绑定成员UID（同上）
+        NSMutableArray *args = [NSMutableArray arrayWithObjects:@(status),channel.channelId?:@"",@(channel.channelType),nil];
+        NSMutableArray *placeholders = [NSMutableArray array];
         for (NSString *uid in uids) {
-            [uidsIns addObject:[NSString stringWithFormat:@"\"%@\"",uid]];
+            [placeholders addObject:@"?"];
+            [args addObject:uid?:@""];
         }
-        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_UPDATE_MEMBER_STATUS,[uidsIns componentsJoinedByString:@","]],@(status),channel.channelId,@(channel.channelType)];
+        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_UPDATE_MEMBER_STATUS,[placeholders componentsJoinedByString:@","]] withArgumentsInArray:args];
     }];
 }
 

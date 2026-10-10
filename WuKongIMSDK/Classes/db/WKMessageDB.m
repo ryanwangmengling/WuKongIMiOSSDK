@@ -494,12 +494,14 @@ static WKMessageDB *_instance;
     if(clientMsgNos.count==1) {
         result = [db executeQuery:SQL_MESSAGE_WITH_CLIENTMSGNO,clientMsgNos[0]];
     }else {
-        NSMutableArray *newClientMsgNos = [NSMutableArray array];
+        // 使用占位符绑定 clientMsgNo（原实现用双引号拼接进 IN (...)，含引号的 clientMsgNo 会生成非法SQL）
+        NSMutableArray *args = [NSMutableArray array];
+        NSMutableArray *placeholders = [NSMutableArray array];
         for (NSString *clientMsgNo in clientMsgNos) {
-            [newClientMsgNos addObject:[NSString stringWithFormat:@"\"%@\"",clientMsgNo]];
+            [placeholders addObject:@"?"];
+            [args addObject:clientMsgNo?:@""];
         }
-        NSString *ids = [newClientMsgNos componentsJoinedByString:@","];
-        result=  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_WITH_CLIENTMSGNOS,ids]];
+        result=  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_WITH_CLIENTMSGNOS,[placeholders componentsJoinedByString:@","]] withArgumentsInArray:args];
     }
     while (result.next) {
         NSDictionary *resultDic = result.resultDictionary;

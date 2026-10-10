@@ -43,13 +43,15 @@ static WKRobotDB *_instance;
     if(!robotIDs || robotIDs.count==0) {
         return nil;
     }
-    NSMutableArray *sqlRobotIDs = [NSMutableArray array];
+    NSMutableArray<NSString*> *bindValues = [NSMutableArray array];
+    NSMutableArray<NSString*> *placeholders = [NSMutableArray array];
     for (NSString *robotID in robotIDs) {
-        [sqlRobotIDs addObject:[NSString stringWithFormat:@"\"%@\"",robotID]];
+        [bindValues addObject:robotID?:@""];
+        [placeholders addObject:@"?"];
     }
     NSMutableArray<WKRobot*> *robots = [NSMutableArray array];
     [[[WKDB sharedDB] dbQueue] inDatabase:^(FMDatabase * _Nonnull db) {
-        FMResultSet *result=  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_ROBOTS_WITH_IDS,[sqlRobotIDs componentsJoinedByString:@","]]];
+        FMResultSet *result=  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_ROBOTS_WITH_IDS,[placeholders componentsJoinedByString:@","]] withArgumentsInArray:bindValues];
         while (result.next) {
             [robots addObject:[self toRobot:result]];
         }
@@ -62,13 +64,15 @@ static WKRobotDB *_instance;
     if(!usernames || usernames.count==0) {
         return nil;
     }
-    NSMutableArray *sqlUsernames = [NSMutableArray array];
+    NSMutableArray<NSString*> *bindValues = [NSMutableArray array];
+    NSMutableArray<NSString*> *placeholders = [NSMutableArray array];
     for (NSString *username in usernames) {
-        [sqlUsernames addObject:[NSString stringWithFormat:@"\"%@\"",username]];
+        [bindValues addObject:username?:@""];
+        [placeholders addObject:@"?"];
     }
     NSMutableArray<WKRobot*> *robots = [NSMutableArray array];
     [[[WKDB sharedDB] dbQueue] inDatabase:^(FMDatabase * _Nonnull db) {
-        FMResultSet *result=  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_ROBOTS_WITH_USERNAMES,[sqlUsernames componentsJoinedByString:@","]]];
+        FMResultSet *result=  [db executeQuery:[NSString stringWithFormat:@"%@ (%@)",SQL_ROBOTS_WITH_USERNAMES,[placeholders componentsJoinedByString:@","]] withArgumentsInArray:bindValues];
         while (result.next) {
             [robots addObject:[self toRobot:result]];
         }
