@@ -227,7 +227,7 @@ NS_ASSUME_NONNULL_BEGIN
 /**
   彻底将消息从数据库删除 （deleteMessage只是标记为删除）
  */
-- (void)destoryMessage:(WKMessage *)message;
+- (BOOL)destoryMessage:(WKMessage *)message; // Round 37: 返回 NO 表示删除失败，重发路径据此中止
 
 /**
   获取指定频道内指定发送者的消息集合

@@ -1200,12 +1200,54 @@ C. 让根因可观测：
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r36 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r36.log`。
 
 ---
+## Round 37 — 消息单条写（状态/删除/已读）失败不再静默 + 重发删除失败中止（2026-10-12）
+
+### 37.1 背景
+- 承接 R32–R36 的「失败不得谎报成功 / 失败必须可观测」主线，本轮把最后一块仍静默的写路径——`WKMessageDB` 的单条状态更新、单条/批量删除、已读标记——补上失败 WARN。
+- `WKChatManager.resendMessage:`（`manager/WKChatManager.m`:103-116）是唯一带「先删旧行再重发」语义的入口：它先 `[[WKMessageDB shared] destoryMessage:message]`，再 `sendMessage:...clientMsgNo:message.clientMsgNo`。而 `destoryMessage:` 原为 `void` 且丢弃 `executeUpdate`：
+  - `SQL_MESSAGE_DESTORY_ID`（`db/WKMessageDB.m`:93）= `delete from message where id=?`，按自增主键 id 删除（`message.clientSeq` 即 `lastInsertRowId`）；
+  - `saveMessages:` 落库前会按 `getMessageWithMessageIdOrClientMsgNo:clientMsgNo:db:` 做存在性去重，同 `clientMsgNo` 的行会被**跳过**。
+- 因此若 `destoryMessage:` 失败（DB 忙/文件损坏等），旧行仍在，`saveMessages:` 会因去重跳过新行 → 消息实际已发出，但**没有落库**，重启 App 后该消息消失。这是「删除失败仍继续重发」导致的真实一致性 bug。
+
+### 37.2 Android 对照（本轮为 iOS 自身修复）
+- **无对应 Android commit**：`WKConnection.resendMsg()`（`WuKongIMAndroidSDK/wkim/src/main/java/com/xinbida/wukongim/message/WKConnection.java`:625-651）是「连接层重放未发送成功消息」的队列重发（按 `clientSeq` 排序、间隔 150ms 重投），**不删除任何数据库行**，与 iOS 用户触发的 `resendMessage:`（删行 + 重发）不是同一语义；Android 侧也没有对应的 `destoryMessage` 调用点（全量 grep `重发|deleteMessage(|destoryMessage` 无匹配）。
+- 其余 void 单条写（`deleteMessagesWithClientSeqs:`、`deleteMessagesWithMessageIDs:`、`updateMessageStatus:`、`updateMessageUploadingToFailStatus`、`updateMessageRevoke:`、`updateViewed:`）在 Android 侧同样普遍忽略返回值，本轮只是补齐 iOS 的可观测性，不改变行为。
+
+### 37.3 改动（2 个文件 / 13 处；均为「捕获 `executeUpdate` 返回值，失败打 WARN，不改语义」，仅重发路径再据此中止）
+一、`db/WKMessageDB.h`
+- `- (void)destoryMessage:(WKMessage *)message;`（:230）返回类型 `void` → `BOOL`，注释注明「返回 NO 表示删除失败，重发路径据此中止」。
+二、`db/WKMessageDB.m`（12 处）
+- `deleteMessagesWithClientSeqs:`（现 :797，WARN :804）：`if(![db executeUpdate:...])` 打 `WARN: 按 clientSeq 批量删除消息失败 ids:%@ error:%@`。
+- `deleteMessagesWithMessageIDs:db:`（现 :817）两个分支（:823 单条、:828 批量）各加 `if(![...])` + WARN（`按 messageId 删除消息失败` / `按 messageId 批量删除消息失败`）。
+- `destoryMessage:`（现 :835）签名 `void`→`BOOL`，新增 `__block BOOL success = YES;`，`success = [db executeUpdate:SQL_MESSAGE_DESTORY_ID,@(message.clientSeq)]`，失败打 `WARN: 重发前删除旧消息失败 clientSeq:%u error:%@`，返回 `success`。
+- `deleteMessage:db:`（现 :859，WARN :863）：失败打 `WARN: 删除消息失败 messageId:%llu`。
+- `clearMessages:`（现 :868，WARN :870）：失败打 `WARN: 清空频道消息失败 channelId:%@ ...`；`clearAllMessages`（现 :876，WARN :878）失败打 `WARN: 清空全部消息失败`。
+- `clearFromMsgSeq:maxMsgSeq:isContain:`（现 :884，WARN :888）：失败打 `WARN: 清理 maxMessageSeq 之前(含)的消息失败 ... maxMsgSeq:%u contain:%d`。
+- `updateMessageUploadingToFailStatus`（现 :919，WARN :921）：失败打 `WARN: 上传中的消息置为发送失败状态失败`。
+- `updateMessageStatus:withClientSeq:`（现 :955，WARN :957）：失败打 `WARN: 更新消息状态失败 status:%ld clientSeq:%u`。
+- `updateMessageRevoke:clientMsgNo:`（现 :964，WARN :966）：失败打 `WARN: 更新消息撤回状态失败 clientMsgNo:%@ revoke:%d`。
+- `updateViewed:`（现 :972，WARN :985）：失败打 `WARN: 标记消息已读失败 messageIds:%@`；仍原样返回入参 `messages`（语义不变，DOM 侧已就地改了 `viewed`/`viewedAt`）。
+三、`manager/WKChatManager.m`（1 处）
+- `resendMessage:`（现 :103-116）：`destoryMessage:` 返回 NO 时打 `WARN: 重发前删除旧消息失败，已中止重发 clientMsgNo:%@` 并 `return nil`（不再 `sendMessage:`），从而避免「发出但未落库」。
+
+### 37.4 判定
+- 除 `destoryMessage:` 外，其余方法**只加日志、不改签名/语义**：状态更新、删除、已读标记的调用方（`WKRetryManager`、`WKMediaManager`、`WKChatManager`）拿到失败也无补偿动作，故不引入 BOOL 返回值，避免无意义的 API 扩张（与 R36 的决定性成功位不同，那处 UI 通知取决成败）。
+- 未把 `saveMessage:` 改成「落库失败返回 nil」：`saveMessage:` 走 `[self saveMessages:@[message]]`，而 `saveMessages:` 返回空数组既可能是「消息入库拦截器判定不存」（`needStoreOfIntercept:`，合法特性：不存但发送），也可能是写库失败；在不区分二者前改返回值会破坏「不存但发送」。该「区分空结果原因」列入 R38 候选。
+- `WKChatManager.sendMessage:` 仍不检查 `saveMessage:` 返回的落库结果（同上原因）。
+- `updateMessageUploadingToFailStatus`/`updateMessageStatus:` 的失败只影响本地状态显示，服务端以收到 `clientMsgNo` 的 ACK 为准，不产生脏数据。
+
+### 37.5 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r37 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**，`error:` 计数 0，日志 `/tmp/wk_build_r37.log`。本轮未新增文件，无需 `pod install`。
+- 全量 grep 确认 2 个文件中所有 `Round 37` 标记与预期一致（`WKMessageDB.m` 11 处 WARN + `destoryMessage:` BOOL 化 + `WKChatManager.m` 1 处守卫）。
+
+---
 ## 待办（后续轮次）
-- Round 37 候选（按优先级）：
-  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage:...` 忽略 `WKMessageDB` 落库结果；`WKMessageDB` 其余 void update：`updateMessageStatus:withClientSeq:`、`deleteMessagesWithClientSeqs:`、`destoryMessage:` 等失败处理）。
-  2. `WKChannelMemberDB.deleteMembers:`、`WKConversationExtraDB.updateVersion:` 等单条写仍忽略 `executeUpdate` 失败，评估统一上报。
+- Round 38 候选（按优先级）：
+  1. `WKChatManager.saveMessage:`/`WKMessageDB.saveMessages:` 返回空结果的**原因可区分**：区分「入库拦截器判定不存」（合法）与「写库失败」，前者保持发送、后者打 WARN（甚至返回未落库标记）。不能在未区分前改返回 nil。
+  2. `WKChannelMemberDB.deleteMembers:`（现 :161-165）、`WKConversationExtraDB.updateVersion:`（现 :38-42）等单条写仍忽略 `executeUpdate` 失败，评估统一上报（本轮未动）。
   3. `WKConversationDB.addConversation:`/`updateConversation:`（无 db 重载）是否也需向上返回结果。
   4. `WKConnectionManager` 非 isDebug 日志是否有 payload/敏感信息打印（R30/R33 已复核为异常路径、保留）。
   5. 复查 `WKCoder.encodeLM:` 空 body 退化是否会让服务端拒包（R31 已改为不崩溃）。
   6. Android 未移植提交扫描——已确认近期（2025-2026）未移植提交几乎全是 Java/连接池/新功能，iOS 可移植面基本耗尽。
+  7. 崩溃面复查：R37 开工前已逐个核对 `substringToIndex`/`objectAtIndex:0`/`[0]`/`firstObject` 的越界守卫，未发现新缺口（详见本轮勘察记录）。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。

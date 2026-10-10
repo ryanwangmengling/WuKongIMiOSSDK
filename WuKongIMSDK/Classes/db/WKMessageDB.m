@@ -801,7 +801,9 @@ static WKMessageDB *_instance;
     }
     [WKDB.sharedDB.dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
         NSString *idStrs = [ids componentsJoinedByString:@","];
-        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_DELETE_CLIENT_SEQS,idStrs]];
+        if(![db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_DELETE_CLIENT_SEQS,idStrs]]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 按 clientSeq 批量删除消息失败 ids:%@ error:%@",idStrs,db.lastErrorMessage);
+        }
     }];
 }
 
@@ -818,19 +820,28 @@ static WKMessageDB *_instance;
     }
     if(messageIDs.count == 1) {
         NSNumber *messageID = messageIDs[0];
-        [db executeUpdate:SQL_MESSAGE_DELETE_MESSAGE_ID,messageID];
+        if(![db executeUpdate:SQL_MESSAGE_DELETE_MESSAGE_ID,messageID]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 按 messageId 删除消息失败 messageId:%@ error:%@",messageID,db.lastErrorMessage);
+        }
     }else {
         NSString *idStrs = [messageIDs componentsJoinedByString:@","];
-        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_DELETE_MESSAGE_IDS,idStrs]];
+        if(![db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_DELETE_MESSAGE_IDS,idStrs]]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 按 messageId 批量删除消息失败 ids:%@ error:%@",idStrs,db.lastErrorMessage);
+        }
     }
     
 }
 
-- (void)destoryMessage:(WKMessage *)message {
+-(BOOL)destoryMessage:(WKMessage *)message {
+    __block BOOL success = YES;
     
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_DESTORY_ID,@(message.clientSeq)];
+        success = [db executeUpdate:SQL_MESSAGE_DESTORY_ID,@(message.clientSeq)];
+        if(!success) {
+            NSLog(@"WARN: 重发前删除旧消息失败 clientSeq:%u error:%@",message.clientSeq,db.lastErrorMessage);
+        }
     }];
+    return success;
 }
 
 -(NSArray<WKMessage*>*) getMessages:(NSString*)fromUID channel:(WKChannel*)channel {
@@ -849,18 +860,24 @@ static WKMessageDB *_instance;
     if(!message || message.messageId <=0) {
         return;
     }
-    [db executeUpdate:SQL_MESSAGE_DELETE_MESSAGE_ID,@(message.messageId)];
+    if(![db executeUpdate:SQL_MESSAGE_DELETE_MESSAGE_ID,@(message.messageId)]) { // Round 37：失败不再静默
+        NSLog(@"WARN: 删除消息失败 messageId:%llu error:%@",message.messageId,db.lastErrorMessage);
+    }
 }
 
 -(void) clearMessages:(WKChannel *)channel {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_DELETE_CHANNEL,channel.channelId?:@"",@(channel.channelType)];
+        if(![db executeUpdate:SQL_MESSAGE_DELETE_CHANNEL,channel.channelId?:@"",@(channel.channelType)]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 清空频道消息失败 channelId:%@ channelType:%d error:%@",channel.channelId?:@"",channel.channelType,db.lastErrorMessage);
+        }
     }];
 }
 
 -(void) clearAllMessages {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_DELETE_ALL];
+        if(![db executeUpdate:SQL_MESSAGE_DELETE_ALL]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 清空全部消息失败 error:%@",db.lastErrorMessage);
+        }
     }];
 }
 
@@ -868,7 +885,9 @@ static WKMessageDB *_instance;
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
         NSString *sql = isContain?SQL_MESSAGE_DELETE_MAXMESSAGESEQ_CONTAIN:SQL_MESSAGE_DELETE_MAXMESSAGESEQ;
         
-        [db executeUpdate:sql,channel.channelId?:@"",@(channel.channelType),@(maxMsgSeq)];
+        if(![db executeUpdate:sql,channel.channelId?:@"",@(channel.channelType),@(maxMsgSeq)]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 清理 maxMessageSeq 之前(含)的消息失败 channelId:%@ maxMsgSeq:%u contain:%d error:%@",channel.channelId?:@"",maxMsgSeq,isContain,db.lastErrorMessage);
+        }
     }];
 }
 
@@ -899,7 +918,9 @@ static WKMessageDB *_instance;
 
 -(void) updateMessageUploadingToFailStatus{
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_UPDATE_STATUS_WITH_STATUS,@(WK_MESSAGE_FAIL),@(WK_MESSAGE_UPLOADING)];
+        if(![db executeUpdate:SQL_MESSAGE_UPDATE_STATUS_WITH_STATUS,@(WK_MESSAGE_FAIL),@(WK_MESSAGE_UPLOADING)]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 上传中的消息置为发送失败状态失败 error:%@",db.lastErrorMessage);
+        }
     }];
 }
 
@@ -933,14 +954,18 @@ static WKMessageDB *_instance;
 
 -(void) updateMessageStatus:(WKMessageStatus)status withClientSeq:(uint32_t)clientSeq {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_UPDATE_STATUS,@(status),@(clientSeq)];
+        if(![db executeUpdate:SQL_MESSAGE_UPDATE_STATUS,@(status),@(clientSeq)]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 更新消息状态失败 status:%ld clientSeq:%u error:%@",(long)status,clientSeq,db.lastErrorMessage);
+        }
     }];
 }
 
 
 -(void) updateMessageRevoke:(BOOL)revoke clientMsgNo:(NSString*)clientMsgNo {
     [[WKDB sharedDB].dbQueue inDatabase:^(FMDatabase * _Nonnull db) {
-        [db executeUpdate:SQL_MESSAGE_UPDATE_REVOKE_CLIENTMSGNO,@(revoke?1:0),clientMsgNo?:@""];
+        if(![db executeUpdate:SQL_MESSAGE_UPDATE_REVOKE_CLIENTMSGNO,@(revoke?1:0),clientMsgNo?:@""]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 更新消息撤回状态失败 clientMsgNo:%@ revoke:%d error:%@",clientMsgNo?:@"",revoke,db.lastErrorMessage);
+        }
     }];
 }
 
@@ -957,7 +982,9 @@ static WKMessageDB *_instance;
             message.viewedAt = time;
         }
         NSString *ids = [messageIDs componentsJoinedByString:@","];
-        [db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_VIEWED_UPDATE,ids],@(time)];
+        if(![db executeUpdate:[NSString stringWithFormat:@"%@ (%@)",SQL_MESSAGE_VIEWED_UPDATE,ids],@(time)]) { // Round 37：失败不再静默
+            NSLog(@"WARN: 标记消息已读失败 messageIds:%@ error:%@",ids,db.lastErrorMessage);
+        }
     }];
     return messages;
 }

@@ -106,7 +106,12 @@
         NSLog(@"WARN: resendMessage 参数非法（message/content/channel/channelId/clientMsgNo 为空），已忽略本次重发。");
         return nil;
     }
-    [[WKMessageDB shared] destoryMessage:message];
+    // 重发依赖先删除旧消息行：若删除失败，同一 clientMsgNo 会在 saveMessages 的存在性去重中被跳过，
+    // 结果是「消息已发出但未落库」（重启后丢失）。故删除失败必须中止重发（Round 37）。
+    if(![[WKMessageDB shared] destoryMessage:message]) {
+        NSLog(@"WARN: 重发前删除旧消息失败，已中止重发 clientMsgNo:%@",message.clientMsgNo);
+        return nil;
+    }
     return  [self sendMessage:message.content channel:message.channel setting:message.setting clientMsgNo:message.clientMsgNo topic:message.topic];
 }
 
