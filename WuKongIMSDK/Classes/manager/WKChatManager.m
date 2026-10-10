@@ -1865,8 +1865,8 @@
             if(error!=nil) {
                 if(complete) {
                     complete(error);
-                    return;
                 }
+                return;
             }
             if(results && results.count>0) {
                 NSMutableArray<NSNumber*> *messageIDs = [NSMutableArray array];
@@ -1908,8 +1908,19 @@
             }
             if(results && results.count>=[WKSDK shared].options.messageExtraSyncLimit) {
                 [weakSelf syncMessageExtra:channel complete:complete maxReqCount:maxCount];
+                return;
+            }
+            // 本页数据不足一页，说明已同步到末尾，回调 complete，避免上层等待回调永久挂起。
+            // （iOS 自有缺陷，无对应 Android commit）
+            if(complete) {
+                complete(nil);
             }
         });
+    } else {
+        // 未设置同步提供者时也要回调，避免上层永久等待。
+        if(complete) {
+            complete([NSError errorWithDomain:@"未设置消息扩展同步提供者[syncMessageExtraProvider]！" code:0 userInfo:nil]);
+        }
     }
 }
 

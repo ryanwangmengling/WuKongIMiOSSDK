@@ -126,10 +126,16 @@ static WKMediaManager *_instance;
     id<WKTaskProto> downloadTask = self.downloadTaskProvider(message);
     if(!downloadTask) {
         NSLog(@"没有获取到下载任务，请设置下载任务提供者[[WKSDK shared].mediaManager setDownloadTaskProvider!");
+        if(callback) {
+            callback(WKMediaDownloadStateFail,0,[NSError errorWithDomain:@"没有获取到下载任务，请设置下载任务提供者[downloadTaskProvider]！" code:0 userInfo:nil]);
+        }
         return nil;
     }
     if(![downloadTask isKindOfClass:[WKMessageFileDownloadTask class]]) {
         NSLog(@"任务需要继承WKMessageFileDownloadTask!");
+        if(callback) {
+            callback(WKMediaDownloadStateFail,0,[NSError errorWithDomain:@"下载任务需要继承WKMessageFileDownloadTask！" code:0 userInfo:nil]);
+        }
         return nil;
     }
     WKMessageFileDownloadTask *messageDownloadTask = (WKMessageFileDownloadTask*)downloadTask;

@@ -1094,7 +1094,12 @@ static dispatch_queue_t _imsocketQueue;
    __block BOOL hasComplete = false;
     self.onConnectStatusChange = ^(WKConnectStatus status) {
         if(status == WKConnected) {
+            if(hasComplete) {
+                return;
+            }
             hasComplete = true;
+            // 成功回调后立即注销 onConnectStatusChange，避免超时前再次收到 WKConnected 时重复回调 complete。
+            self.onConnectStatusChange = nil;
             if(complete) {
                 complete(nil);
             }

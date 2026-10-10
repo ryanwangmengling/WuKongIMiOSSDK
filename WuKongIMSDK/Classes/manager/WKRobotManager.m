@@ -34,9 +34,15 @@ static WKRobotManager *_instance;
 -(void) sync:(NSArray<NSString*>*)robotIDs complete:(void(^)(BOOL hasData,NSError *error))complete{
     if(!self.syncRobotProvider) {
         NSLog(@"没有设置syncRobotProvider 忽略掉同步robot");
+        if(complete) {
+            complete(false,[NSError errorWithDomain:@"未设置机器人同步提供者[syncRobotProvider]！" code:0 userInfo:nil]);
+        }
         return;
     }
     if(!robotIDs || robotIDs.count ==0) {
+        if(complete) {
+            complete(false,nil);
+        }
         return;
     }
     
@@ -81,9 +87,15 @@ static WKRobotManager *_instance;
 -(void) syncWithUsernames:(NSArray<NSString*>*)usernames complete:(void(^)(BOOL hasData,NSError *error))complete {
     if(!self.syncRobotProvider) {
         NSLog(@"没有设置syncRobotProvider 忽略掉同步robot");
+        if(complete) {
+            complete(false,[NSError errorWithDomain:@"未设置机器人同步提供者[syncRobotProvider]！" code:0 userInfo:nil]);
+        }
         return;
     }
     if(!usernames || usernames.count ==0) {
+        if(complete) {
+            complete(false,nil);
+        }
         return;
     }
     

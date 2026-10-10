@@ -810,12 +810,39 @@ Android 无对应 commit：Android 侧无 `updateChannelSetting`/`ChannelSetting
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r23 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，`WKData.m`/`WKCoder.m` 无新增告警，日志 `/tmp/wk_build_r23.log`）。本轮未新增文件，无需 `pod install`。
 
 ---
+
+## Round 24 — 同步/完成回调契约修复：complete/callback 不再挂起或重复触发（iOS 自有缺陷）（2026-10-10）
+
+### 24.1 背景
+对全库带完成回调的公开 API 做普查（`WKRobotManager` sync/syncWithUsernames、`WKChatManager` syncMessageExtra、`WKConnectionManager` wakeup、`WKMediaManager` download:callback:），发现多处「提前 return 却不回调 complete/callback」以及「成功后重复回调」，上层等待回调的代码会永久挂起或收到重复完成通知：
+
+- `manager/WKChatManager.m` `syncMessageExtra:complete:maxReqCount:`（:1849）三处缺陷：
+  (a) 未设置 `syncMessageExtraProvider` 时直接走到方法末尾，**从不调用 complete**；
+  (b) 提供者返回成功且本页 `results.count < messageExtraSyncLimit`（即已到最后一页）时既不递归也不回调 complete → **正常同步完成反而永久挂起**；
+  (c) `error!=nil` 分支的 `return` 写在 `if(complete)` 内，`complete==nil` 时会继续处理错误页数据。
+- `manager/WKRobotManager.m` `sync:complete:`（:34-79）与 `syncWithUsernames:complete:`（:81-126）：未设置 `syncRobotProvider`（:35-38/:82-85）或传入空数组（:39-41/:86-88）时提前 return 且不调用 complete。
+- `manager/WKConnectionManager.m` `wakeup:complete:`（:1086-1116）：连接成功回调后未注销 `onConnectStatusChange`，超时前若再次收到 `WKConnected` 会**重复调用** complete。
+- `manager/WKMediaManager.m` `download:callback:`（:124-156）：`downloadTaskProvider` 未设置或返回非 `WKMessageFileDownloadTask` 时 `return nil` 且不回调 callback，上层 loading 无法结束。
+
+### 24.2 改动
+- `manager/WKChatManager.m`：`syncMessageExtra:` 的 error 分支改为**无条件 return**（不再依赖 `complete` 非空）；本页 results 不足一页时回调 `complete(nil)`；新增 `else` 分支（同步提供者缺失）回调 `complete(NSError …)`，保证 complete 恰好被调用一次。
+- `manager/WKRobotManager.m`：两个方法的「provider 缺失」「数组为空」分支分别回调 `complete(false, NSError …)` 与 `complete(false, nil)`。
+- `manager/WKConnectionManager.m`：`wakeup:` 的状态回调块内新增 `hasComplete` 幂等判断，成功后立即 `self.onConnectStatusChange = nil`，避免重复回调。
+- `manager/WKMediaManager.m`：`download:callback:` 两处 `return nil` 前回调 `callback(WKMediaDownloadStateFail,0,NSError …)`。
+
+### 24.3 判定不移植 / 附带结论
+- Android 无 `syncMessageExtra` 同构实现（grep `syncMessageExtra` 仅 `WKCMDKeys.wk_sync_message_extra` 字符串与 `ConversationManager.saveSyncMsgExtras`，语义不同）；`WKRobotManager`、`WKMediaManager`、`wakeup:` 亦为 iOS 自有 API 或 Android 无同构实现 → **本轮为 iOS 自有缺陷修复，无对应 Android commit**。
+- 附带确认无同问题：`WKChatManager` 的 pullLastMessages/pullDown/pullUp/pullAround/pullMessages 系列（核心 :835 的早退走 `completePullMessages:`，:862/884/…）、`WKReceiptManager.flush:complete:`（:113-117/:127-132）、`WKChannelRequestQueue addRequest:`、`WKReactionManager addOrCancelReaction:`（后两者 R19 已修）在所有提前 return 路径都会回调 complete。
+
+### 24.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r24 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r24.log`）。本轮未新增文件，无需 `pod install`。
+
+---
 ## 待办（后续轮次）
-- Round 24 候选（按优先级）：
-  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
-  2. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查。
-  3. 全库其余「提前 return 不回调 complete」的 API 契约普查（R19 已修 `WKChannelRequestQueue`/`WKReactionManager`，可继续扫 `WKChatManager`/`WKChannelManager`）。
-  4. `WKMediaManager` 的 `delegates`（NSHashTable）从未赋值、`addDelegate:`/`removeDelegate:` 为 no-op（R22 勘察发现，属死代码；确认无调用方后清理或补全 getter）。
-  5. `WKDataWrite.encodeLength:`（`coder/WKCoder.m:67-78`）对 `length==0` 返回空数据（缺少长度前缀），核查是否存在零长度 body 的包会踩中。
-  6. `WKConnectionManager.handlePacketData:` 内多条未受 `isDebug` 保护的 `NSLog`（:893/:897/:900 等）在热路径上，评估收敛为 `isDebug` 保护。
+- Round 25 候选（按优先级）：
+  1. `WKMediaManager` 的 `delegates`（NSHashTable）从未赋值、`addDelegate:`/`removeDelegate:` 为 no-op，且协议方法 `mediaManageUpdate:` 全库无任何调用点（R22/R24 勘察发现，属死代码；确认无调用方后清理或补全 getter + 触发点）。
+  2. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写）。
+  3. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查。
+  4. `WKDataWrite.encodeLength:`（`coder/WKCoder.m:67-78`）对 `length==0` 返回空数据（缺少长度前缀），核查是否存在零长度 body 的包会踩中。
+  5. `WKConnectionManager.handlePacketData:` 内多条未受 `isDebug` 保护的 `NSLog`（:893/:897/:900 等）在热路径上，评估收敛为 `isDebug` 保护。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
