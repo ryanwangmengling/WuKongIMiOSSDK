@@ -208,13 +208,12 @@ static WKMessageDB *_instance;
                             NSLog(@"消息已存在 -> %llu messageSeq: %u",message.messageId,message.messageSeq);
                         }
                     }else {
-                        [self insertMessage:message db:db clientMsgNo:[NSString stringWithFormat:@"%@-%u",message.clientMsgNo,message.messageSeq] isDeleted:1];
+                        [self insertMessage:message db:db clientMsgNo:[NSString stringWithFormat:@"%@-%u",message.clientMsgNo?:@"",message.messageSeq] isDeleted:1];
                         message.isDeleted = 1;
                     }
                     continue;
                 }
                 
-                [newMessages addObject:message];
                 NSString *searchableWord = @"";
                 if(message.content && message.content.searchableWord) {
                     searchableWord =message.content.searchableWord;
@@ -235,17 +234,22 @@ static WKMessageDB *_instance;
                 bool success =  [db executeUpdate:SQL_MESSAGE_SAVE,@(message.messageId),@(message.messageSeq),@(orderSeq),message.clientMsgNo?:@"",message.streamNo?:@"",@(message.timestamp),message.fromUid?:@"",message.toUid?:@"",message.channel.channelId?:@"",@(message.channel.channelType),@(message.contentType),message.contentData?:@"",searchableWord?:@"",@(message.voiceReaded),@(message.status),@(message.reasonCode),[self extraToStr:message.extra],@([message.setting toUint8]),@(message.content.flame),@(message.content.flameSecond),@(message.viewed),@(message.viewedAt),@(message.expire),@(expireAt),@(message.isDeleted)];
                 
                 if(success) {
+                    // 仅入库成功的消息才算“新消息”（原实现无论成功失败都加入 newMessages，失败时 DB 无对应行却仍会更新最近会话）
+                    [newMessages addObject:message];
                     message.clientSeq = (uint32_t)db.lastInsertRowId;
                     message.orderSeq = orderSeq;
-                }
-                if(message.hasRemoteExtra) { // 添加扩展消息
-                    [[WKMessageExtraDB shared] addOrUpdateMessageExtra:message.remoteExtra db:db];
-                }
-                if(message.reactions && message.reactions.count>0) {
-                    [[WKReactionDB shared] insertOrUpdateReactions:message.reactions db:db];
-                }
-                if(message.streams && message.streams.count>0) {
-                    [self saveOrUpdateStreams:message.streams db:db];
+                    if(message.hasRemoteExtra) { // 添加扩展消息
+                        [[WKMessageExtraDB shared] addOrUpdateMessageExtra:message.remoteExtra db:db];
+                    }
+                    if(message.reactions && message.reactions.count>0) {
+                        [[WKReactionDB shared] insertOrUpdateReactions:message.reactions db:db];
+                    }
+                    if(message.streams && message.streams.count>0) {
+                        [self saveOrUpdateStreams:message.streams db:db];
+                    }
+                }else {
+                    // 原实现忽略插入失败（如 client_msg_no 唯一冲突/为空、IO/约束错误）：消息仍被当作新消息返回，extra/最近会话照常写入，但 DB 中并无该行 —— 静默数据丢失。
+                    NSLog(@"WARN: 消息入库失败，已跳过 messageId:%llu messageSeq:%u clientMsgNo:%@ error:%@",message.messageId,message.messageSeq,message.clientMsgNo?:@"",db.lastErrorMessage);
                 }
                 
             }
@@ -274,8 +278,11 @@ static WKMessageDB *_instance;
                 if(dupMessage && dupMessage.messageSeq!=message.messageSeq) {
                     NSLog(@"messageSeq:%u clientMsgNo: %@",message.messageSeq,message.clientMsgNo);
                     // 这里说明插入失败就认为是clientMsgNo冲突,修改clientMsgNo然后将消息设置为已删除状态，这样主要是为了不让messageSeq出现间断
-                    [self insertMessage:message db:db clientMsgNo:[NSString stringWithFormat:@"%@-%u",message.clientMsgNo,message.messageSeq] isDeleted:1];
+                    [self insertMessage:message db:db clientMsgNo:[NSString stringWithFormat:@"%@-%u",message.clientMsgNo?:@"",message.messageSeq] isDeleted:1];
                     message.isDeleted = 1;
+                }else {
+                    // 原实现静默吞掉插入失败：dupMessage 为 nil（client_msg_no 为空/NULL、或其他约束/IO 失败）或 seq 相同时，消息既不入库也无任何日志，永久丢失且无线索。
+                    NSLog(@"WARN: 消息替换入库失败且无同 clientMsgNo 的冲突行，消息被丢弃 messageId:%llu messageSeq:%u clientMsgNo:%@ error:%@",message.messageId,message.messageSeq,message.clientMsgNo?:@"",db.lastErrorMessage);
                 }
                 
             }
@@ -311,7 +318,7 @@ static WKMessageDB *_instance;
     if(message.expireAt) {
         expireAt = [message.expireAt timeIntervalSince1970];
     }
-    return  [db executeUpdate:SQL_MESSAGE_SAVE,@(message.messageId),@(message.messageSeq),@(orderSeq),clientMsgNo,message.streamNo?:@"",@(message.timestamp),message.fromUid?:@"",message.toUid?:@"",message.channel.channelId?:@"",@(message.channel.channelType),@(message.contentType),message.contentData?:@"",searchableWord?:@"",@(message.voiceReaded),@(message.status),@(message.reasonCode),[self extraToStr:message.extra],@([message.setting toUint8]),@(message.content.flame),@(message.content.flameSecond),@(message.viewed),@(message.viewedAt),@(message.expire),@(expireAt),@(isDeleted)];
+    return  [db executeUpdate:SQL_MESSAGE_SAVE,@(message.messageId),@(message.messageSeq),@(orderSeq),clientMsgNo?:@"",message.streamNo?:@"",@(message.timestamp),message.fromUid?:@"",message.toUid?:@"",message.channel.channelId?:@"",@(message.channel.channelType),@(message.contentType),message.contentData?:@"",searchableWord?:@"",@(message.voiceReaded),@(message.status),@(message.reasonCode),[self extraToStr:message.extra],@([message.setting toUint8]),@(message.content.flame),@(message.content.flameSecond),@(message.viewed),@(message.viewedAt),@(message.expire),@(expireAt),@(isDeleted)];
 }
 
 -(BOOL) existMessage:(uint64_t)messageId db:(FMDatabase*)db{

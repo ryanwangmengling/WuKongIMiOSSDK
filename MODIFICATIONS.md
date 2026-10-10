@@ -862,11 +862,34 @@ Android 无对应 commit：Android 侧无 `updateChannelSetting`/`ChannelSetting
 ### 25.4 验证
 - `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r25 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`BUILD_EXIT=0`，`error:` 计数 0，日志 `/tmp/wk_build_r25.log`）。本轮未新增文件，无需 `pod install`。
 
+## Round 26 — 消息落库不再静默丢失：入库失败纳入错误处理 + client_msg_no 空值兜底（iOS 自有加固）（2026-10-10）
+
+### 26.1 背景
+`WuKongIMSDK/Classes/db/WKMessageDB.m` 的两条写路径都把 `executeUpdate` 的失败结果静默丢弃，可能造成「内存/最近会话有消息、DB 无该行」或「消息永久丢失且无任何日志」：
+
+- `saveMessages:`（:199-260）先按 `messageId`/`clientMsgNo` 查存在性，未命中即拼 `SQL_MESSAGE_SAVE` 写入。原实现在 **insert 之前**就把 message 加入 `newMessages`，且 `bool success` 只用于设 `clientSeq`/`orderSeq`，失败不处理；随后 `hasRemoteExtra`/`reactions`/`streams` 仍照写。返回的 `newMessages` 会经 `WKChatManager.addOrUpdateConversationWithMessages:` 更新最近会话，于是 DB 插入失败时最近会话会指向一条并不存在的消息（后续按 clientSeq 读取时拿到空）。
+- `replaceMessages:`（:262-301）在 `insertMessage:` 失败后查同 `clientMsgNo` 的冲突行：仅当找到且 `messageSeq` 不同才插一条 `clientMsgNo = "<clientMsgNo>-<seq>"` 的删除态副本。若 `dupMessage == nil`（如 `client_msg_no` 为空/为 NULL、或其他约束/IO 错误）或 seq 相同，分支直接落空 —— **消息既不入库也无任何日志**。
+- `insertMessage:db:clientMsgNo:isDeleted:`（:305-322）把传入的 `clientMsgNo` 直接绑定进 SQL。schema（`Assets/Migrations/202005281108.sql:1/3`）为 `client_msg_no varchar(80) not null default ''` 且 `CREATE UNIQUE INDEX idx_client_msg_no`，绑定 nil 会写入 NULL 违反 NOT NULL，插入必然失败；而 `replaceMessages:` 恰好把 `message.clientMsgNo` 原样传入，客户端拼接的同步消息若未填 clientMsgNo 就会落入上面的静默丢弃分支。
+
+### 26.2 改动（`WuKongIMSDK/Classes/db/WKMessageDB.m`）
+1. `saveMessages:`：把 `[newMessages addObject:message]` 从 insert 之前移到 **`success` 分支内**，仅入库成功的消息才计入 `newMessages`（即才更新最近会话）。
+2. `saveMessages:`：`hasRemoteExtra`→`WKMessageExtraDB`、`reactions`→`WKReactionDB`、`streams`→`saveOrUpdateStreams` 一并移入 `success` 分支，避免 DB 无该行却写出孤儿扩展/反应/流数据；新增 `else` 分支打印 `WARN: 消息入库失败...`（含 messageId/messageSeq/clientMsgNo/`db.lastErrorMessage`）。
+3. `saveMessages:` 冲突副本 `clientMsgNo` 兜底：`[NSString stringWithFormat:@"%@-%u", message.clientMsgNo ?: @"", message.messageSeq]`。
+4. `replaceMessages:`：在 `if(dupMessage && dupMessage.messageSeq != message.messageSeq)` 后补 `else`，打印 `WARN: 消息替换入库失败且无同 clientMsgNo 的冲突行，消息被丢弃...`；该 if 内副本 `clientMsgNo` 同样做 `?:@""` 兜底。
+5. `insertMessage:db:clientMsgNo:isDeleted:`：绑定改为 `clientMsgNo ?: @""`，杜绝 nil→NULL 违反 `client_msg_no NOT NULL`。
+
+### 26.3 判定不移植 / 附带结论
+- Android 参考提交 `d005ce6`（perf Bugly#30231 OOM：`saveSyncChannelMSGs` 删除冗余 `queryWithMsgIds`）与 `18d12c6`（`update sync channel messages`，实为把 `queryWithMsgIds`+`getMsgReactionsAndRefreshMsg` 注释掉的 hack）在 iOS 的 `pullMessages`（`WKChatManager.m:1028-1051/:1061-1121`）与 `handleRecv` 路径**没有同构的二次查询**，无法忠实 cherry-pick；本轮按 `d005ce6` 的「同步入库可靠性、避免多余物化」意图在 iOS 侧独立修复，记为 iOS 自有加固。
+- **评估后不做**：`saveMessages:` 的 N+1 存在性查询不批量化。该查询对新消息返回 0 行、不触发 `toMessage:` 的 `decodeContent`，只是 N 次带索引的 `SELECT`；要批量化需动态拼 `IN`，并改变「按 message_id **或** client_msg_no 命中」的去重语义，收益低、回归风险高，故不改。
+
+### 26.4 验证
+- `cd Example && xcodebuild -workspace WuKongIMSDK.xcworkspace -scheme WuKongIMSDK -sdk iphoneos -configuration Debug -derivedDataPath /tmp/wkdd_r26 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build` → **BUILD SUCCEEDED**（`error:` 计数 0）。本轮未新增文件，无需 `pod install`。
+
 ---
 ## 待办（后续轮次）
-- Round 26 候选（按优先级）：
-  1. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB.saveMessages:` :199-256 循环内 `getMessageWithMessageIdOrClientMsgNo:clientMsgNo:db:` 的 N+1 存在性查询，`replaceMessages:` :258-294 在 `dupMessage==nil` 时静默吞掉插入失败）。
-  2. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查。
-  3. `WKRobotDB.m:52/71` 用双引号包字符串拼 `IN (...)` 的 DQS 风险（R20 遗留）。
-  4. `WKConnectionManager` 其余未受 `isDebug` 保护的低频日志（:596/:615/:812/:1013/:1072）是否统一收敛。
+- Round 27 候选（按优先级）：
+  1. `WKChannelManager`/`WKChannelMemberDB` 分页同步链路走查：`WKChannelMemberDB.getMembersWithChannel:keyword:page:limit:`（:190-205）`offset=(page-1)*limit` 在 `page==0` 时为负偏移、未夹取。
+  2. `WKConnectionManager` 其余未受 `isDebug` 保护的低频/异常日志（:596/:615/:812/:1013/:1072）是否统一收敛。
+  3. `WKChatManager` 发送/重发与 DB 写入链路继续下钻（`saveMessage`/`updateMessage` 批量写；`WKMessageDB` 其余写路径的失败处理）。
+  4. R20 遗留 `WKRobotDB.m:52/71` 双引号拼 `IN (...)`：R21 已改为 `?` 占位符绑定（`queryRobots:`/`queryRobotsWithUsernames:`），复核确认无残留。
 - 纯新功能（非稳定性，单独评估）：`ce1086b`/`ff7196b` 设置设备信息、`4f917b7` 添加单个频道成员、`b3e8e11` 连接节点、`3904ad5` 频道状态。
